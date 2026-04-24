@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local logs and runtime artifacts
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Editor/project-local metadata
+.idea/
+.vscode/
+
+# Agent/local metadata
+.serena/
+.worktrees/
+worktrees/

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    name: Shell checks
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install shell tooling
+        run: brew install shellcheck shfmt
+
+      - name: Check Bash syntax
+        run: bash -n update-all-mac.command
+
+      - name: Run ShellCheck
+        run: shellcheck -s bash update-all-mac.command
+
+      - name: Check formatting with shfmt
+        run: shfmt -i 4 -ci -bn -d update-all-mac.command
