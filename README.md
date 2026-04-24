@@ -1,8 +1,8 @@
 # update-all-mac
 
-One-click macOS updater for Homebrew formulae and casks, Mac App Store apps, global npm packages, Oh My Zsh, pipx packages, uv tools, and optional macOS update checks.
+One-command macOS updater for Homebrew formulae and casks, Mac App Store apps, global npm packages, Oh My Zsh, pipx packages, uv tools, and optional macOS update checks.
 
-The script is designed for personal Macs where several package managers coexist. It can be run from Terminal or by double-clicking the `.command` file in Finder.
+The recommended installation path is Homebrew. It avoids the common macOS Gatekeeper friction that happens when unsigned `.command` files are downloaded through a browser and opened from Finder.
 
 ## What It Updates
 
@@ -24,24 +24,63 @@ Missing tools are skipped. The script does not install package managers for you.
 
 ## Install
 
-Clone the repository:
+Recommended Homebrew install:
+
+```bash
+brew tap mzored/tap
+brew install mzored/tap/update-all-mac
+```
+
+Then run:
+
+```bash
+update-all-mac
+```
+
+Alternative install from Git:
 
 ```bash
 git clone https://github.com/MZored/update-all-mac.git
 cd update-all-mac
 chmod +x update-all-mac.command
+./update-all-mac.command
 ```
 
-Or download just the script:
+Alternative direct script download:
 
 ```bash
 curl -fsSL -o update-all-mac.command https://raw.githubusercontent.com/MZored/update-all-mac/main/update-all-mac.command
 chmod +x update-all-mac.command
+./update-all-mac.command
+```
+
+Avoid piping the network directly into a shell. Download the file first, review it, then run it.
+
+## macOS Gatekeeper and Browser Downloads
+
+If you use GitHub's **Download ZIP** button or download `update-all-mac.command` through a browser, macOS may attach a quarantine marker. Because this project ships a shell script rather than a signed and notarized macOS app, double-clicking the downloaded `.command` file in Finder can show a Gatekeeper warning.
+
+Use Homebrew, `git clone`, or the Terminal `curl -o` flow above when possible. If you intentionally downloaded the script through a browser, review it first and then remove the quarantine marker:
+
+```bash
+xattr -d com.apple.quarantine update-all-mac.command
+```
+
+After that, run it from Terminal:
+
+```bash
+./update-all-mac.command
 ```
 
 ## Usage
 
 Run all default update steps:
+
+```bash
+update-all-mac
+```
+
+If you installed from Git or downloaded the script directly, use:
 
 ```bash
 ./update-all-mac.command
@@ -50,37 +89,37 @@ Run all default update steps:
 Show help:
 
 ```bash
-./update-all-mac.command --help
+update-all-mac --help
 ```
 
 List step IDs:
 
 ```bash
-./update-all-mac.command --list-steps
+update-all-mac --list-steps
 ```
 
 Run only selected steps:
 
 ```bash
-./update-all-mac.command --only homebrew,mas
+update-all-mac --only homebrew,mas
 ```
 
 Skip selected steps:
 
 ```bash
-./update-all-mac.command --skip npm,pip
+update-all-mac --skip npm,pip
 ```
 
 Check macOS updates too:
 
 ```bash
-./update-all-mac.command --macos
+update-all-mac --macos
 ```
 
 Useful non-interactive run:
 
 ```bash
-UPDATE_ALL_NO_PAUSE=1 ./update-all-mac.command --no-color
+UPDATE_ALL_NO_PAUSE=1 update-all-mac --no-color
 ```
 
 ## Options
@@ -158,6 +197,7 @@ If a previous run crashed, the script detects stale locks and removes them when 
 - Some updates can close, replace, or relaunch apps. The script warns when Homebrew cask apps appear to be running.
 - `--force-cask-repair` can uninstall and reinstall a cask as a recovery fallback. Use it only when you understand the risk.
 - The macOS step checks for system updates but does not install them.
+- A signed and notarized `.app` or `.pkg` would be required for the cleanest double-click Finder experience. This repository currently distributes a CLI script.
 
 ## Troubleshooting
 
@@ -167,7 +207,7 @@ If double-clicking does nothing, run from Terminal to see output:
 ./update-all-mac.command --no-color
 ```
 
-If macOS blocks the downloaded script, remove quarantine after reviewing it:
+If macOS blocks a browser-downloaded script, review the file and remove quarantine:
 
 ```bash
 xattr -d com.apple.quarantine update-all-mac.command
