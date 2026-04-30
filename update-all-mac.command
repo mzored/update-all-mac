@@ -3,8 +3,8 @@
 # Full macOS app and package updater
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
-# Date: 2026-04-24
-# Version: 3.1.0
+# Date: 2026-04-30
+# Version: 3.1.1
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -132,6 +132,17 @@ step_index_by_id() {
         idx=$((idx + 1))
     done
     return 1
+}
+
+step_selected_by_id() {
+    local id="$1"
+    local idx=""
+
+    if ! idx=$(step_index_by_id "$id"); then
+        return 1
+    fi
+
+    [ "${STEP_SELECTED[$idx]:-0}" = "1" ]
 }
 
 parse_args() {
@@ -786,11 +797,38 @@ update_uv() {
     local had_warn=0
     local uv_output=""
     local uv_exit=0
+    local brew_outdated_output=""
+    local brew_outdated_exit=0
 
-    # If uv is installed through Homebrew, the binary is covered by the Homebrew step,
-    # but uv tools are separate and still need `uv tool upgrade --all`.
+    # If uv is installed through Homebrew, use Homebrew for the binary and
+    # still update uv tools separately.
     if command -v brew >/dev/null 2>&1 && brew list --formula 2>/dev/null | grep -Fxq "uv"; then
-        log "  ${GREEN}→ uv is installed through Homebrew; the binary is upgraded by the Homebrew step${NC}"
+        if step_selected_by_id "homebrew"; then
+            log "  ${GREEN}→ uv is installed through Homebrew; the binary is upgraded by the Homebrew step${NC}"
+        else
+            log "  → uv is installed through Homebrew; updating the uv formula..."
+            if ! brew_update_catalog; then
+                log "${RED}  ⚠️  Could not update Homebrew indexes for uv${NC}"
+                return 1
+            fi
+
+            brew_outdated_output=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet uv 2>&1)
+            brew_outdated_exit=$?
+            if [ "$brew_outdated_exit" -ne 0 ]; then
+                log "${RED}  ⚠️  Could not check the Homebrew uv formula${NC}"
+                log "  → $brew_outdated_output"
+                return 1
+            fi
+
+            if printf '%s\n' "$brew_outdated_output" | grep -Fxq "uv"; then
+                if ! HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula uv; then
+                    log "${RED}  ⚠️  Could not update uv through Homebrew${NC}"
+                    return 1
+                fi
+            else
+                log "  ${GREEN}→ Homebrew uv formula is up to date${NC}"
+            fi
+        fi
     else
         uv_output=$(uv self update 2>&1)
         uv_exit=$?

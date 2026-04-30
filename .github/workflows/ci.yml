@@ -27,6 +27,9 @@ jobs:
       - name: Check release documentation
         run: tests/release_docs_test.sh
 
+      - name: Run behavior tests
+        run: tests/uv_homebrew_only_test.sh
+
       - name: Check Homebrew formula
         run: |
           ruby -c Formula/update-all-mac.rb
