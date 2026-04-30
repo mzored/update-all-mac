@@ -19,8 +19,13 @@ reject_text() {
     fi
 }
 
-require_text 'brew install mzored/tap/update-all-mac'
+require_text 'brew tap mzored/update-all-mac https://github.com/mzored/update-all-mac'
+require_text 'brew install update-all-mac'
+require_text 'Migrating From the Old Tap'
+require_text 'brew untap mzored/tap'
 require_text 'macOS Gatekeeper'
 require_text 'Download ZIP'
 require_text 'xattr -d com.apple.quarantine update-all-mac.command'
+reject_text 'brew tap mzored/tap'
+reject_text 'brew install mzored/tap/update-all-mac'
 reject_text 'curl -fsSL https://raw.githubusercontent.com/MZored/update-all-mac/main/update-all-mac.command | bash'

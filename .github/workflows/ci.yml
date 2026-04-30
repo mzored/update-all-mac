@@ -26,3 +26,11 @@ jobs:
 
       - name: Check release documentation
         run: tests/release_docs_test.sh
+
+      - name: Check Homebrew formula
+        run: |
+          ruby -c Formula/update-all-mac.rb
+          brew tap mzored/update-all-mac "$GITHUB_WORKSPACE"
+          brew audit --formula mzored/update-all-mac/update-all-mac
+          brew install --build-from-source mzored/update-all-mac/update-all-mac
+          brew test mzored/update-all-mac/update-all-mac

@@ -27,8 +27,8 @@ Missing tools are skipped. The script does not install package managers for you.
 Recommended Homebrew install:
 
 ```bash
-brew tap mzored/tap
-brew install mzored/tap/update-all-mac
+brew tap mzored/update-all-mac https://github.com/mzored/update-all-mac
+brew install update-all-mac
 ```
 
 Then run:
@@ -40,7 +40,7 @@ update-all-mac
 Alternative install from Git:
 
 ```bash
-git clone https://github.com/MZored/update-all-mac.git
+git clone https://github.com/mzored/update-all-mac.git
 cd update-all-mac
 chmod +x update-all-mac.command
 ./update-all-mac.command
@@ -49,12 +49,25 @@ chmod +x update-all-mac.command
 Alternative direct script download:
 
 ```bash
-curl -fsSL -o update-all-mac.command https://raw.githubusercontent.com/MZored/update-all-mac/main/update-all-mac.command
+curl -fsSL -o update-all-mac.command https://raw.githubusercontent.com/mzored/update-all-mac/main/update-all-mac.command
 chmod +x update-all-mac.command
 ./update-all-mac.command
 ```
 
 Avoid piping the network directly into a shell. Download the file first, review it, then run it.
+
+## Migrating From the Old Tap
+
+Earlier versions used a separate Homebrew tap repository. If you installed with the old tap, move to the single-repository tap:
+
+```bash
+brew uninstall update-all-mac
+brew untap mzored/tap
+brew tap mzored/update-all-mac https://github.com/mzored/update-all-mac
+brew install update-all-mac
+```
+
+The source code and Homebrew formula now live in this repository.
 
 ## macOS Gatekeeper and Browser Downloads
 
