@@ -21,15 +21,16 @@ case "$*" in
     "update-if-needed")
         exit 0
         ;;
+    "list --formula")
+        # Simulate a broad list response that is insufficient for uv detection.
+        printf 'mas\n'
+        exit 0
+        ;;
     "list --formula uv")
         printf '/opt/homebrew/Cellar/uv/0.11.8/bin/uv\n'
         exit 0
         ;;
     "outdated --formula --quiet uv")
-        printf 'uv\n'
-        exit 0
-        ;;
-    "upgrade --formula uv")
         exit 0
         ;;
 esac
@@ -45,6 +46,10 @@ set -euo pipefail
 printf 'uv %s\n' "$*" >>"$CALLS_FILE"
 
 case "$*" in
+    "self update")
+        printf 'uv was installed through an external package manager\n'
+        exit 0
+        ;;
     "tool upgrade --help")
         printf 'Usage: uv tool upgrade --all\n'
         exit 0
@@ -70,15 +75,15 @@ CALLS_FILE="$calls_file" \
     --lock-dir "$tmp_dir/lock" \
     --only uv >/dev/null
 
-if ! grep -Fxq 'brew upgrade --formula uv' "$calls_file"; then
-    printf 'Expected --only uv to upgrade Homebrew-managed uv via brew.\n' >&2
+if ! grep -Fxq 'brew list --formula uv' "$calls_file"; then
+    printf 'Expected uv detection to use a direct Homebrew formula check.\n' >&2
     printf 'Observed calls:\n' >&2
     cat "$calls_file" >&2
     exit 1
 fi
 
 if grep -Fxq 'uv self update' "$calls_file"; then
-    printf 'Did not expect uv self update for Homebrew-managed uv.\n' >&2
+    printf 'Did not expect uv self update for directly detected Homebrew-managed uv.\n' >&2
     cat "$calls_file" >&2
     exit 1
 fi

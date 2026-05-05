@@ -30,6 +30,9 @@ jobs:
       - name: Run behavior tests
         run: tests/uv_homebrew_only_test.sh
 
+      - name: Run uv detection regression test
+        run: tests/uv_homebrew_direct_detection_test.sh
+
       - name: Check Homebrew formula
         run: |
           ruby -c Formula/update-all-mac.rb

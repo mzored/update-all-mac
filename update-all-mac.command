@@ -3,8 +3,8 @@
 # Full macOS app and package updater
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
-# Date: 2026-04-30
-# Version: 3.1.1
+# Date: 2026-05-05
+# Version: 3.1.2
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -484,6 +484,12 @@ brew_update_catalog() {
     fi
 }
 
+brew_formula_installed() {
+    local formula="$1"
+
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew list --formula "$formula" >/dev/null 2>&1
+}
+
 brew_cask_outdated() {
     local args=(--cask --quiet)
 
@@ -802,7 +808,7 @@ update_uv() {
 
     # If uv is installed through Homebrew, use Homebrew for the binary and
     # still update uv tools separately.
-    if command -v brew >/dev/null 2>&1 && brew list --formula 2>/dev/null | grep -Fxq "uv"; then
+    if command -v brew >/dev/null 2>&1 && brew_formula_installed "uv"; then
         if step_selected_by_id "homebrew"; then
             log "  ${GREEN}→ uv is installed through Homebrew; the binary is upgraded by the Homebrew step${NC}"
         else
