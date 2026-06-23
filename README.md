@@ -148,11 +148,18 @@ UPDATE_ALL_NO_PAUSE=1 update-all-mac --no-color
 --greedy-casks         Include Homebrew casks marked auto_updates/latest
 --force-cask-repair    Allow forced cask uninstall+install fallback
 --mas-accurate         Use slower, more accurate mas outdated detection
+--parallel             Run npm, pipx, and Mac App Store steps concurrently
 --log-file <path>      Override log file path
 --lock-dir <path>      Override lock directory path
 --list-steps           Print available step IDs and exit
 -h, --help             Show help and exit
 ```
+
+The `--parallel` flag runs the independent npm, pipx, and Mac App Store steps at the
+same time as the heavier Homebrew step, which can shorten total run time. Homebrew, pip,
+and uv always run sequentially because they share state. With `--parallel`, the npm, pipx,
+and Mac App Store blocks are printed together after the sequential steps so the log stays
+readable, and `--fail-fast` only stops the sequential steps.
 
 Step IDs:
 
@@ -183,10 +190,16 @@ UPDATE_ALL_HOMEBREW_GREEDY_CASKS=1
 UPDATE_ALL_FORCE_CASK_REPAIR=1
 UPDATE_ALL_PIPX_INCLUDE_INJECTED=0
 UPDATE_ALL_MAS_ACCURATE=1
+UPDATE_ALL_PARALLEL=1
 UPDATE_ALL_LOG_FILE=/path/to/update-all-mac.log
+UPDATE_ALL_LOG_MAX_BYTES=1048576
+UPDATE_ALL_NET_TIMEOUT=600
 UPDATE_ALL_LOCK_DIR=/tmp/update-all-mac.lock
 UPDATE_ALL_NO_PAUSE=1
 ```
+
+`UPDATE_ALL_NET_TIMEOUT` caps how long the npm step may run (in seconds) when `gtimeout`
+or `timeout` is available, so a stuck download cannot hang the whole run.
 
 ## Logs and Locking
 
@@ -195,6 +208,10 @@ By default, logs are written to:
 ```text
 ~/Library/Logs/update-all-mac.log
 ```
+
+Each step's full command output is captured in the log, so a failed upgrade can be
+diagnosed after the fact. When the log grows past `UPDATE_ALL_LOG_MAX_BYTES` (1 MiB by
+default), it is rotated once to `update-all-mac.log.1` before the next run starts.
 
 A lock directory prevents concurrent runs:
 

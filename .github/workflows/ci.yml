@@ -33,6 +33,21 @@ jobs:
       - name: Run uv detection regression test
         run: tests/uv_homebrew_direct_detection_test.sh
 
+      - name: Run npm network-error test
+        run: tests/npm_network_error_test.sh
+
+      - name: Run log capture test
+        run: tests/run_logged_capture_test.sh
+
+      - name: Run npm post-upgrade check test
+        run: tests/npm_postcheck_warn_test.sh
+
+      - name: Run log rotation test
+        run: tests/log_rotation_test.sh
+
+      - name: Run parallel steps test
+        run: tests/parallel_steps_test.sh
+
       - name: Check Homebrew formula
         run: |
           ruby -c Formula/update-all-mac.rb

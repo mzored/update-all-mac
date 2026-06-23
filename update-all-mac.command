@@ -3,8 +3,8 @@
 # Full macOS app and package updater
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
-# Date: 2026-05-05
-# Version: 3.1.2
+# Date: 2026-06-23
+# Version: 3.2.0
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -22,6 +22,8 @@ STEP_SKIP=20
 STEP_FAIL=30
 
 LOG_FILE="${UPDATE_ALL_LOG_FILE:-$HOME/Library/Logs/update-all-mac.log}"
+LOG_MAX_BYTES="${UPDATE_ALL_LOG_MAX_BYTES:-1048576}"
+NET_TIMEOUT="${UPDATE_ALL_NET_TIMEOUT:-600}"
 DATE=$(date '+%Y-%m-%d %H:%M:%S')
 START_EPOCH=$(date +%s)
 LOCK_DIR="${UPDATE_ALL_LOCK_DIR:-/tmp/update-all-mac.lock}"
@@ -46,6 +48,7 @@ BREW_GREEDY_CASKS=0
 BREW_FORCE_CASK_REPAIR=0
 PIPX_INCLUDE_INJECTED=1
 MAS_ACCURATE=0
+PARALLEL=0
 
 truthy() {
     case "${1:-0}" in
@@ -63,6 +66,7 @@ if truthy "${UPDATE_ALL_HOMEBREW_GREEDY_CASKS:-0}"; then BREW_GREEDY_CASKS=1; fi
 if truthy "${UPDATE_ALL_FORCE_CASK_REPAIR:-0}"; then BREW_FORCE_CASK_REPAIR=1; fi
 if truthy "${UPDATE_ALL_PIPX_INCLUDE_INJECTED:-1}"; then PIPX_INCLUDE_INJECTED=1; else PIPX_INCLUDE_INJECTED=0; fi
 if truthy "${UPDATE_ALL_MAS_ACCURATE:-0}"; then MAS_ACCURATE=1; fi
+if truthy "${UPDATE_ALL_PARALLEL:-0}"; then PARALLEL=1; fi
 
 prepend_path_if_dir() {
     local dir="$1"
@@ -111,6 +115,7 @@ Options:
   --greedy-casks         Include Homebrew casks marked auto_updates/latest
   --force-cask-repair    Allow forced cask uninstall+install fallback
   --mas-accurate         Use slower, more accurate mas outdated detection
+  --parallel             Run npm, pipx, and Mac App Store steps concurrently
   --log-file <path>      Override log file path
   --lock-dir <path>      Override lock directory path
   --list-steps           Print available step IDs and exit
@@ -212,6 +217,10 @@ parse_args() {
                 MAS_ACCURATE=1
                 shift
                 ;;
+            --parallel)
+                PARALLEL=1
+                shift
+                ;;
             --list-steps)
                 LIST_STEPS=1
                 shift
@@ -302,16 +311,74 @@ init_step_selection() {
     done
 }
 
-# Logging helper
+# Strip ANSI color/escape sequences from stdin.
+strip_ansi() {
+    sed -E $'s/\x1B\\[[0-9;]*[mK]//g'
+}
+
+# Logging helper. Writes the colored line to the terminal and a color-stripped
+# copy to the log file descriptor (fd 9), opened by init_logging. Using a fd
+# lets parallel workers redirect their log copy without touching globals.
 log() {
     local message="$1"
     printf '%s\n' "$message"
-    printf '%s\n' "$message" | sed -E $'s/\x1B\\[[0-9;]*[mK]//g' >>"$LOG_FILE"
+    printf '%s\n' "$message" | strip_ansi >&9
+}
+
+# Run an external command, mirroring its combined output live to the terminal
+# and a color-stripped copy to the log file. Returns the command's own exit code
+# (not tee's), so callers can branch on success/failure as usual.
+run_logged() {
+    local tmp="" rc=0
+
+    tmp=$(mktemp "${TMPDIR:-/tmp}/update-all-mac.XXXXXX" 2>/dev/null) || tmp=""
+    if [ -z "$tmp" ]; then
+        # Could not create a temp file; run without log capture rather than fail.
+        "$@"
+        return $?
+    fi
+
+    "$@" 2>&1 | tee "$tmp"
+    rc=${PIPESTATUS[0]}
+    strip_ansi <"$tmp" >&9
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# Run "$@" under a timeout when gtimeout/timeout is available; otherwise run it
+# unchanged. A timed-out command exits 124 (the timeout convention).
+with_timeout() {
+    local secs="$1"
+    shift
+
+    if command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$secs" "$@"
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Drop the existing log to a single rollover file once it grows past the cap,
+# so the log does not grow without bound across many runs.
+rotate_log_if_large() {
+    local size=""
+
+    [ -f "$LOG_FILE" ] || return 0
+    size=$(wc -c <"$LOG_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$size" ] || return 0
+    if [ "$size" -gt "$LOG_MAX_BYTES" ]; then
+        mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+    fi
 }
 
 init_logging() {
     mkdir -p "$(dirname "$LOG_FILE")"
+    rotate_log_if_large
     printf '\n==== [%s] Update run started ====\n' "$DATE" >>"$LOG_FILE"
+    # fd 9 is the canonical log sink used by log() and run_logged().
+    exec 9>>"$LOG_FILE"
 }
 
 validate_lock_dir() {
@@ -362,20 +429,23 @@ acquire_lock() {
     return 1
 }
 
-# Run a step and track its status
-run_step() {
+# Print the banner that introduces a step.
+step_header() {
     local step_num="$1"
     local total_steps="$2"
-    local step_idx="$3"
-    local step_func="${STEP_FUNCS[$step_idx]}"
-    local step_name="${STEP_NAMES[$step_idx]}"
+    local step_name="${STEP_NAMES[$3]}"
 
     log "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     log "${BLUE}📦 $step_num/$total_steps $step_name${NC}"
     log "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+}
 
-    "$step_func"
-    local rc=$?
+# Translate a step return code into a tracked status and a summary line.
+# Returns 0 for OK/WARN/SKIP and 1 for a hard failure.
+step_status_from_rc() {
+    local step_idx="$1"
+    local rc="$2"
+    local step_name="${STEP_NAMES[$step_idx]}"
 
     case "$rc" in
         "$STEP_OK")
@@ -402,6 +472,144 @@ run_step() {
     esac
 }
 
+# Run a step live (header + body + status) and track its result.
+run_step() {
+    local step_num="$1"
+    local total_steps="$2"
+    local step_idx="$3"
+    local step_func="${STEP_FUNCS[$step_idx]}"
+    local rc=0
+
+    step_header "$step_num" "$total_steps" "$step_idx"
+
+    "$step_func"
+    rc=$?
+
+    step_status_from_rc "$step_idx" "$rc"
+}
+
+# Steps that touch independent ecosystems and never call brew, so they are safe
+# to run concurrently with the heavy sequential steps.
+step_is_parallelizable() {
+    case "${STEP_IDS[$1]}" in
+        npm | mas | pipx) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Background worker for parallel mode: run a step with its output captured to a
+# segment file and its return code written to a separate file. No terminal or
+# shared-log writes happen here, so concurrent steps never interleave.
+run_step_worker() {
+    local step_idx="$1"
+    local seg="$2"
+    local rcfile="$3"
+    local step_func="${STEP_FUNCS[$step_idx]}"
+
+    (
+        # Capture everything to the segment; discard the fd 9 log copy here so
+        # the shared log is written once, in order, at replay time.
+        exec >"$seg" 2>&1
+        exec 9>/dev/null
+        "$step_func"
+        printf '%s' "$?" >"$rcfile"
+    )
+}
+
+# Replay a captured step segment (header + body) and apply its status.
+emit_step_segment() {
+    local step_num="$1"
+    local total_steps="$2"
+    local step_idx="$3"
+    local seg="$4"
+    local rc="$5"
+
+    step_header "$step_num" "$total_steps" "$step_idx"
+    if [ -s "$seg" ]; then
+        cat "$seg"
+        strip_ansi <"$seg" >&9
+    fi
+    step_status_from_rc "$step_idx" "$rc"
+}
+
+# Parallel scheduler: launch the parallelizable steps in the background, run the
+# remaining steps live in canonical order, then replay the background results.
+# Step numbers stay canonical; the parallel blocks appear after the live ones.
+run_steps_parallel() {
+    local total_steps="$1"
+    local tmp_root=""
+    local idx=""
+    local seg=""
+    local rcfile=""
+    local rc=0
+    local num=0
+    local i=0
+    local -a disp_num=()
+    local -a bg_idx=()
+    local -a bg_pid=()
+
+    tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/update-all-mac-parallel.XXXXXX")
+
+    num=1
+    for idx in "${RUN_STEP_INDEXES[@]}"; do
+        disp_num[idx]=$num
+        num=$((num + 1))
+    done
+
+    # Launch parallelizable steps in the background.
+    for idx in "${RUN_STEP_INDEXES[@]}"; do
+        if step_is_parallelizable "$idx"; then
+            seg="$tmp_root/seg.$idx"
+            rcfile="$tmp_root/rc.$idx"
+            : >"$seg"
+            printf '%s' "$STEP_FAIL" >"$rcfile"
+            run_step_worker "$idx" "$seg" "$rcfile" &
+            bg_idx+=("$idx")
+            bg_pid+=("$!")
+        fi
+    done
+
+    # Run the remaining steps live, in canonical order.
+    for idx in "${RUN_STEP_INDEXES[@]}"; do
+        if step_is_parallelizable "$idx"; then
+            continue
+        fi
+        if ! run_step "${disp_num[idx]}" "$total_steps" "$idx"; then
+            ANY_STEP_FAILED=1
+            # In parallel mode --fail-fast only stops the live (sequential) steps;
+            # the background batch is already running and is allowed to finish.
+            if [ "$FAIL_FAST" -eq 1 ]; then
+                break
+            fi
+        fi
+        log ""
+    done
+
+    # Wait for the background batch to finish.
+    if [ "${#bg_pid[@]}" -gt 0 ]; then
+        for i in "${!bg_pid[@]}"; do
+            wait "${bg_pid[$i]}" 2>/dev/null || true
+        done
+    fi
+
+    # Replay background steps in canonical order.
+    for idx in "${RUN_STEP_INDEXES[@]}"; do
+        if ! step_is_parallelizable "$idx"; then
+            continue
+        fi
+        seg="$tmp_root/seg.$idx"
+        rcfile="$tmp_root/rc.$idx"
+        rc=$(cat "$rcfile" 2>/dev/null || printf '%s' "$STEP_FAIL")
+        [[ "$rc" =~ ^[0-9]+$ ]] || rc="$STEP_FAIL"
+        if ! emit_step_segment "${disp_num[idx]}" "$total_steps" "$idx" "$seg" "$rc"; then
+            ANY_STEP_FAILED=1
+        fi
+        log ""
+    done
+
+    rm -rf "$tmp_root"
+}
+
 # Check for running GUI apps before cask upgrades
 get_primary_cask_app_path() {
     local cask="$1"
@@ -420,7 +628,7 @@ repair_cask() {
     local cask="$1"
 
     log "  → Repairing cask: $cask"
-    if HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew reinstall --cask "$cask"; then
+    if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew reinstall --cask "$cask"; then
         return 0
     fi
 
@@ -433,7 +641,7 @@ repair_cask() {
     log "${YELLOW}  ⚠️  reinstall failed for $cask; trying uninstall --force + install${NC}"
     HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew uninstall --cask --force "$cask" >/dev/null 2>&1 || true
 
-    if HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --cask "$cask"; then
+    if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --cask "$cask"; then
         return 0
     fi
 
@@ -478,9 +686,9 @@ check_running_apps() {
 
 brew_update_catalog() {
     if brew help update-if-needed >/dev/null 2>&1; then
-        HOMEBREW_NO_ENV_HINTS=1 brew update-if-needed
+        run_logged env HOMEBREW_NO_ENV_HINTS=1 brew update-if-needed
     else
-        HOMEBREW_NO_ENV_HINTS=1 brew update
+        run_logged env HOMEBREW_NO_ENV_HINTS=1 brew update
     fi
 }
 
@@ -507,7 +715,7 @@ brew_cask_upgrade() {
         args+=(--greedy)
     fi
 
-    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade "${args[@]}" "$@"
+    run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade "${args[@]}" "$@"
 }
 
 # === Homebrew update ===
@@ -552,7 +760,8 @@ update_homebrew() {
 
     if [ ${#outdated_formulae[@]} -gt 0 ]; then
         log "  ${YELLOW}→ Outdated formulae found: ${#outdated_formulae[@]}${NC}"
-        if ! HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula "${outdated_formulae[@]}"; then
+        log "$outdated_formulae_raw"
+        if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula "${outdated_formulae[@]}"; then
             log "${RED}  ⚠️  Error while upgrading formulae${NC}"
             had_error=1
         fi
@@ -564,6 +773,7 @@ update_homebrew() {
     if [ ${#outdated_casks[@]} -gt 0 ]; then
         check_running_apps "${outdated_casks[@]}"
         log "  ${YELLOW}→ Outdated apps found: ${#outdated_casks[@]}${NC}"
+        log "$outdated_casks_raw"
 
         for cask in "${outdated_casks[@]}"; do
             app_path=$(get_primary_cask_app_path "$cask")
@@ -617,7 +827,7 @@ update_homebrew() {
     fi
 
     log "  → Cleaning cache..."
-    if ! HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup; then
+    if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup; then
         log "${YELLOW}  ⚠️  Homebrew cleanup completed with warnings${NC}"
         had_warn=1
     fi
@@ -633,6 +843,13 @@ update_homebrew() {
     return "$STEP_OK"
 }
 
+# True when npm output contains an actual error line (network/registry), as
+# opposed to a normal "outdated packages" table. `npm outdated` exits 1 in both
+# cases, so the exit code alone cannot tell them apart.
+npm_output_has_error() {
+    printf '%s\n' "$1" | grep -qiE '^[[:space:]]*npm (error|err!)'
+}
+
 # === npm update ===
 update_npm() {
     if ! command -v npm >/dev/null 2>&1; then
@@ -642,31 +859,57 @@ update_npm() {
 
     local outdated_output=""
     local outdated_exit=0
+    local leftover=""
+    local had_warn=0
+    local rc=0
+    local npm_net=(--fetch-retries=2 --fetch-timeout=60000)
 
     log "  → Checking for outdated packages..."
-    outdated_output=$(npm outdated -g --depth=0 2>&1)
+    outdated_output=$(npm outdated -g --depth=0 "${npm_net[@]}" 2>&1)
     outdated_exit=$?
 
-    if [ "$outdated_exit" -gt 1 ]; then
-        log "${RED}  ⚠️  Could not check global npm packages${NC}"
-        log "  → $outdated_output"
-        return 1
+    # A failed check (network/registry) must not be mistaken for "updates
+    # available" — otherwise a blind `npm update -g` runs against a broken
+    # connection (and may hang).
+    if npm_output_has_error "$outdated_output" || [ "$outdated_exit" -gt 1 ]; then
+        log "${RED}  ⚠️  Could not check global npm packages (network or registry error)${NC}"
+        log "$outdated_output"
+        return "$STEP_FAIL"
     fi
 
     if [ "$outdated_exit" -eq 0 ] || [ -z "$outdated_output" ]; then
         log "  ${GREEN}→ Global npm packages are up to date${NC}"
-        return 0
+        return "$STEP_OK"
     fi
 
     log "$outdated_output"
     log "  → Upgrading..."
 
-    if ! npm update -g; then
-        log "${RED}  ⚠️  npm update failed${NC}"
-        return 1
+    run_logged with_timeout "$NET_TIMEOUT" npm update -g "${npm_net[@]}"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ]; then
+            log "${RED}  ⚠️  npm update timed out after ${NET_TIMEOUT}s${NC}"
+        else
+            log "${RED}  ⚠️  npm update failed${NC}"
+        fi
+        return "$STEP_FAIL"
     fi
 
-    return 0
+    # Verify the upgrade actually cleared the outdated packages (e.g. a global
+    # left behind on an older major). Mirrors the Homebrew cask re-check.
+    leftover=$(npm outdated -g --depth=0 "${npm_net[@]}" 2>&1)
+    if ! npm_output_has_error "$leftover" && [ -n "$leftover" ]; then
+        log "${YELLOW}  ⚠️  Some global npm packages are still outdated after upgrade:${NC}"
+        log "$leftover"
+        had_warn=1
+    fi
+
+    if [ "$had_warn" -ne 0 ]; then
+        return "$STEP_WARN"
+    fi
+
+    return "$STEP_OK"
 }
 
 # === Mac App Store update ===
@@ -700,12 +943,12 @@ update_mas() {
     log "$outdated_output"
     log "  → Upgrading..."
 
-    if mas update "$accuracy_arg"; then
+    if run_logged mas update "$accuracy_arg"; then
         return 0
     fi
 
     # Fallback for older mas versions/aliases.
-    if mas upgrade "$accuracy_arg"; then
+    if run_logged mas upgrade "$accuracy_arg"; then
         return 0
     fi
 
@@ -724,7 +967,7 @@ update_ohmyzsh() {
 
     if [ -x "$zsh_root/tools/upgrade.sh" ]; then
         log "  → Updating with bundled upgrade.sh..."
-        if ! ZSH="$zsh_root" DISABLE_UPDATE_PROMPT=true "$zsh_root/tools/upgrade.sh" -v silent; then
+        if ! run_logged env ZSH="$zsh_root" DISABLE_UPDATE_PROMPT=true "$zsh_root/tools/upgrade.sh" -v silent; then
             log "${RED}  ⚠️  Oh My Zsh update failed${NC}"
             return 1
         fi
@@ -732,7 +975,7 @@ update_ohmyzsh() {
     fi
 
     log "  → tools/upgrade.sh not found; using git pull..."
-    if ! (cd "$zsh_root" && git pull --ff-only --quiet); then
+    if ! run_logged git -C "$zsh_root" pull --ff-only; then
         log "${RED}  ⚠️  Oh My Zsh update through git failed${NC}"
         return 1
     fi
@@ -773,14 +1016,14 @@ update_pipx() {
         args+=(--include-injected)
     fi
 
-    if ! pipx "${args[@]}"; then
+    if ! run_logged pipx "${args[@]}"; then
         log "${RED}  ⚠️  pipx package update failed${NC}"
         return 1
     fi
 
     if pipx upgrade-shared --help >/dev/null 2>&1; then
         log "  → Updating shared pipx libraries..."
-        if ! pipx upgrade-shared; then
+        if ! run_logged pipx upgrade-shared; then
             log "${YELLOW}  ⚠️  pipx upgrade-shared completed with warnings${NC}"
             had_warn=1
         fi
@@ -827,7 +1070,7 @@ update_uv() {
             fi
 
             if printf '%s\n' "$brew_outdated_output" | grep -Fxq "uv"; then
-                if ! HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula uv; then
+                if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula uv; then
                     log "${RED}  ⚠️  Could not update uv through Homebrew${NC}"
                     return 1
                 fi
@@ -854,7 +1097,7 @@ update_uv() {
 
     if uv tool upgrade --help 2>/dev/null | grep -q -- '--all'; then
         log "  → Updating uv tools..."
-        if ! uv tool upgrade --all; then
+        if ! run_logged uv tool upgrade --all; then
             log "${RED}  ⚠️  uv tools update failed${NC}"
             return 1
         fi
@@ -985,17 +1228,22 @@ log ""
 run_total=${#RUN_STEP_INDEXES[@]}
 ANY_STEP_FAILED=0
 ANY_STEP_WARN=0
-step_num=1
-for step_idx in "${RUN_STEP_INDEXES[@]}"; do
-    if ! run_step "$step_num" "$run_total" "$step_idx"; then
-        ANY_STEP_FAILED=1
-        if [ "$FAIL_FAST" -eq 1 ]; then
-            break
+
+if [ "$PARALLEL" -eq 1 ]; then
+    run_steps_parallel "$run_total"
+else
+    step_num=1
+    for step_idx in "${RUN_STEP_INDEXES[@]}"; do
+        if ! run_step "$step_num" "$run_total" "$step_idx"; then
+            ANY_STEP_FAILED=1
+            if [ "$FAIL_FAST" -eq 1 ]; then
+                break
+            fi
         fi
-    fi
-    log ""
-    step_num=$((step_num + 1))
-done
+        log ""
+        step_num=$((step_num + 1))
+    done
+fi
 
 print_summary
 
