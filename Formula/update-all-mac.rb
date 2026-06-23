@@ -1,8 +1,8 @@
 class UpdateAllMac < Formula
   desc "Update common macOS app and package managers"
   homepage "https://github.com/mzored/update-all-mac"
-  url "https://github.com/mzored/update-all-mac/archive/refs/tags/v3.1.2.tar.gz"
-  sha256 "9af2286e1dd57fd1231be7fbe215a07fe340a1c93be17d9b0a8041272844cca1"
+  url "https://github.com/mzored/update-all-mac/archive/refs/tags/v3.2.0.tar.gz"
+  sha256 "33766115cbc511a71109c1885483311d072427b23702c58043fa391e626420fb"
   license "MIT"
 
   def install
