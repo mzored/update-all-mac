@@ -1,6 +1,6 @@
 # update-all-mac
 
-One-command macOS updater for Homebrew formulae and casks, Mac App Store apps, global npm packages, Oh My Zsh, pipx packages, uv tools, and optional macOS update checks.
+One-command macOS updater for Homebrew formulae and casks, Mac App Store apps, global npm packages, Oh My Zsh, pipx packages, uv tools, Rust/cargo, mise, asdf, gcloud components, and optional macOS update checks.
 
 The recommended installation path is Homebrew. It avoids the common macOS Gatekeeper friction that happens when unsigned `.command` files are downloaded through a browser and opened from Finder.
 
@@ -12,15 +12,21 @@ The recommended installation path is Homebrew. It avoids the common macOS Gateke
 - Oh My Zsh
 - pipx packages and shared pipx libraries
 - uv tools and, when possible, uv itself
+- Rust toolchains (`rustup`) and globally installed crates (`cargo install-update`)
+- mise-managed tools (`mise upgrade`)
+- asdf plugins (`asdf plugin update --all`)
+- Google Cloud CLI components (`gcloud components update`)
 - Optional macOS update check through `softwareupdate -l`
 
-Missing tools are skipped. The script does not install package managers for you.
+Every step self-detects its tool and is skipped when the tool is absent, so the same
+command works on any Mac. The script does not install package managers for you, except
+that `--install-homebrew` will bootstrap Homebrew on a fresh Mac when you opt in.
 
 ## Requirements
 
 - macOS
 - Bash available at `/bin/bash` (included with macOS)
-- Optional tools depending on what you want to update: `brew`, `npm`, `mas`, `git`, `python3`/`pip3`, `pipx`, and `uv`
+- Optional tools depending on what you want to update: `brew`, `npm`, `mas`, `git`, `python3`/`pip3`, `pipx`, `uv`, `rustup`/`cargo`, `mise`, `asdf`, and `gcloud`
 
 ## Install
 
@@ -111,6 +117,24 @@ List step IDs:
 update-all-mac --list-steps
 ```
 
+Report which tools are detected on this Mac (and their versions):
+
+```bash
+update-all-mac --doctor
+```
+
+Preview what would be updated without changing anything:
+
+```bash
+update-all-mac --dry-run
+```
+
+Bootstrap a fresh Mac by installing Homebrew if it is missing:
+
+```bash
+update-all-mac --install-homebrew
+```
+
 Run only selected steps:
 
 ```bash
@@ -149,9 +173,12 @@ UPDATE_ALL_NO_PAUSE=1 update-all-mac --no-color
 --force-cask-repair    Allow forced cask uninstall+install fallback
 --mas-accurate         Use slower, more accurate mas outdated detection
 --parallel             Run npm, pipx, and Mac App Store steps concurrently
+--dry-run              Show what would be updated without changing anything
+--install-homebrew     Install Homebrew if it is missing (bootstrap a Mac)
 --log-file <path>      Override log file path
 --lock-dir <path>      Override lock directory path
 --list-steps           Print available step IDs and exit
+--doctor               Report detected tools/versions and exit
 -h, --help             Show help and exit
 ```
 
@@ -171,8 +198,17 @@ ohmyzsh    Oh My Zsh
 pip        pip
 pipx       pipx
 uv         uv
+rust       Rust (rustup + cargo)
+mise       mise
+asdf       asdf
+gcloud     gcloud
 macos      macOS (only when --macos is used)
 ```
+
+`--dry-run` runs each step's read-only detection and prints what it *would* update,
+without refreshing the Homebrew catalog or changing anything. `--doctor` prints the
+tools detected on the current Mac and their versions, then exits. `--install-homebrew`
+installs Homebrew non-interactively when it is missing (opt-in bootstrap for a new Mac).
 
 ## Environment Variables
 
@@ -191,6 +227,8 @@ UPDATE_ALL_FORCE_CASK_REPAIR=1
 UPDATE_ALL_PIPX_INCLUDE_INJECTED=0
 UPDATE_ALL_MAS_ACCURATE=1
 UPDATE_ALL_PARALLEL=1
+UPDATE_ALL_DRY_RUN=1
+UPDATE_ALL_INSTALL_HOMEBREW=1
 UPDATE_ALL_LOG_FILE=/path/to/update-all-mac.log
 UPDATE_ALL_LOG_MAX_BYTES=1048576
 UPDATE_ALL_NET_TIMEOUT=600

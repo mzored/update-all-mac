@@ -3,8 +3,8 @@
 # Full macOS app and package updater
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
-# Date: 2026-06-23
-# Version: 3.2.0
+# Date: 2026-07-01
+# Version: 3.3.0
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -28,9 +28,9 @@ DATE=$(date '+%Y-%m-%d %H:%M:%S')
 START_EPOCH=$(date +%s)
 LOCK_DIR="${UPDATE_ALL_LOCK_DIR:-/tmp/update-all-mac.lock}"
 
-STEP_IDS=("homebrew" "npm" "mas" "ohmyzsh" "pip" "pipx" "uv")
-STEP_NAMES=("Homebrew" "npm" "Mac App Store" "Oh My Zsh" "pip" "pipx" "uv")
-STEP_FUNCS=("update_homebrew" "update_npm" "update_mas" "update_ohmyzsh" "check_pip" "update_pipx" "update_uv")
+STEP_IDS=("homebrew" "npm" "mas" "ohmyzsh" "pip" "pipx" "uv" "rust" "mise" "asdf" "gcloud")
+STEP_NAMES=("Homebrew" "npm" "Mac App Store" "Oh My Zsh" "pip" "pipx" "uv" "Rust" "mise" "asdf" "gcloud")
+STEP_FUNCS=("update_homebrew" "update_npm" "update_mas" "update_ohmyzsh" "check_pip" "update_pipx" "update_uv" "update_rust" "update_mise" "update_asdf" "update_gcloud")
 STEP_STATUS=()
 STEP_SELECTED=()
 TOTAL_STEPS=${#STEP_NAMES[@]}
@@ -49,6 +49,9 @@ BREW_FORCE_CASK_REPAIR=0
 PIPX_INCLUDE_INJECTED=1
 MAS_ACCURATE=0
 PARALLEL=0
+DRY_RUN=0
+DOCTOR=0
+INSTALL_HOMEBREW=0
 
 truthy() {
     case "${1:-0}" in
@@ -67,6 +70,8 @@ if truthy "${UPDATE_ALL_FORCE_CASK_REPAIR:-0}"; then BREW_FORCE_CASK_REPAIR=1; f
 if truthy "${UPDATE_ALL_PIPX_INCLUDE_INJECTED:-1}"; then PIPX_INCLUDE_INJECTED=1; else PIPX_INCLUDE_INJECTED=0; fi
 if truthy "${UPDATE_ALL_MAS_ACCURATE:-0}"; then MAS_ACCURATE=1; fi
 if truthy "${UPDATE_ALL_PARALLEL:-0}"; then PARALLEL=1; fi
+if truthy "${UPDATE_ALL_DRY_RUN:-0}"; then DRY_RUN=1; fi
+if truthy "${UPDATE_ALL_INSTALL_HOMEBREW:-0}"; then INSTALL_HOMEBREW=1; fi
 
 prepend_path_if_dir() {
     local dir="$1"
@@ -116,14 +121,66 @@ Options:
   --force-cask-repair    Allow forced cask uninstall+install fallback
   --mas-accurate         Use slower, more accurate mas outdated detection
   --parallel             Run npm, pipx, and Mac App Store steps concurrently
+  --dry-run              Show what would be updated without changing anything
+  --install-homebrew     Install Homebrew if it is missing (bootstrap a Mac)
   --log-file <path>      Override log file path
   --lock-dir <path>      Override lock directory path
   --list-steps           Print available step IDs and exit
+  --doctor               Report detected tools/versions and exit
   -h, --help             Show this help and exit
 
 Step IDs:
 $(print_steps | sed 's/^/  /')
 EOF
+}
+
+# One line of the --doctor report: a label, the command that must exist, and an
+# optional version command. Uses printf (not log) because --doctor runs before
+# the log file descriptor is opened.
+doctor_line() {
+    local label="$1"
+    local cmd="$2"
+    shift 2
+    local ver=""
+
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        printf '%s\n' "  ${YELLOW}-${NC} ${label}: not installed"
+        return 0
+    fi
+
+    if [ "$#" -gt 0 ]; then
+        ver=$("$@" 2>/dev/null | head -n1 | tr -d '\r')
+    fi
+    printf '%s\n' "  ${GREEN}+${NC} ${label}: ${ver:-installed}"
+}
+
+# --doctor: report which managed tools are present and their versions so the
+# user can see at a glance what this script can update on their Mac.
+print_doctor() {
+    printf '%s\n\n' "${BLUE}update-all-mac — doctor${NC}"
+    printf '%s\n' "Detected tools:"
+    doctor_line "Homebrew" brew brew --version
+    doctor_line "npm" npm npm --version
+    doctor_line "Mac App Store (mas)" mas mas version
+    doctor_line "git" git git --version
+    doctor_line "python3" python3 python3 --version
+    doctor_line "pipx" pipx pipx --version
+    doctor_line "uv" uv uv --version
+    doctor_line "rustup" rustup rustup --version
+    doctor_line "cargo" cargo cargo --version
+    doctor_line "mise" mise mise --version
+    doctor_line "asdf" asdf asdf --version
+    doctor_line "gcloud" gcloud gcloud --version
+    doctor_line "softwareupdate" softwareupdate
+
+    if [ -d "$HOME/.oh-my-zsh" ]; then
+        printf '%s\n' "  ${GREEN}+${NC} Oh My Zsh: installed"
+    else
+        printf '%s\n' "  ${YELLOW}-${NC} Oh My Zsh: not installed"
+    fi
+
+    printf '\n%s\n' "Configured steps: $(print_steps | awk '{print $1}' | tr '\n' ' ')"
+    printf '%s\n' "Tip: add --dry-run to preview changes, or --parallel to speed up independent steps."
 }
 
 step_index_by_id() {
@@ -221,8 +278,20 @@ parse_args() {
                 PARALLEL=1
                 shift
                 ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --install-homebrew)
+                INSTALL_HOMEBREW=1
+                shift
+                ;;
             --list-steps)
                 LIST_STEPS=1
+                shift
+                ;;
+            --doctor)
+                DOCTOR=1
                 shift
                 ;;
             -h | --help)
@@ -316,6 +385,18 @@ strip_ansi() {
     sed -E $'s/\x1B\\[[0-9;]*[mK]//g'
 }
 
+# Drop known-benign macOS libmalloc diagnostics that some subprocesses (notably
+# Homebrew's bundled ruby during cask upgrades) print to stderr. They are
+# cosmetic and unrelated to a command's success, but pollute both the terminal
+# and the log. Patterns are intentionally specific so genuine errors survive.
+# --line-buffered (supported by macOS BSD grep) keeps live output streaming.
+filter_benign_noise() {
+    grep --line-buffered -v -E \
+        -e "MallocStackLogging: can't turn off malloc stack logging because it was not enabled" \
+        -e 'Nano zone abandoned due to inability to reserve vm space' \
+        || true
+}
+
 # Logging helper. Writes the colored line to the terminal and a color-stripped
 # copy to the log file descriptor (fd 9), opened by init_logging. Using a fd
 # lets parallel workers redirect their log copy without touching globals.
@@ -334,11 +415,11 @@ run_logged() {
     tmp=$(mktemp "${TMPDIR:-/tmp}/update-all-mac.XXXXXX" 2>/dev/null) || tmp=""
     if [ -z "$tmp" ]; then
         # Could not create a temp file; run without log capture rather than fail.
-        "$@"
-        return $?
+        "$@" 2>&1 | filter_benign_noise
+        return "${PIPESTATUS[0]}"
     fi
 
-    "$@" 2>&1 | tee "$tmp"
+    "$@" 2>&1 | filter_benign_noise | tee "$tmp"
     rc=${PIPESTATUS[0]}
     strip_ansi <"$tmp" >&9
     rm -f "$tmp"
@@ -526,10 +607,29 @@ emit_step_segment() {
 
     step_header "$step_num" "$total_steps" "$step_idx"
     if [ -s "$seg" ]; then
-        cat "$seg"
-        strip_ansi <"$seg" >&9
+        filter_benign_noise <"$seg"
+        strip_ansi <"$seg" | filter_benign_noise >&9
     fi
     step_status_from_rc "$step_idx" "$rc"
+}
+
+# Sequential scheduler: run every selected step live, in canonical order. Also
+# the fallback when parallel mode cannot allocate its scratch directory.
+run_steps_sequential() {
+    local total_steps="$1"
+    local step_num=1
+    local step_idx=""
+
+    for step_idx in "${RUN_STEP_INDEXES[@]}"; do
+        if ! run_step "$step_num" "$total_steps" "$step_idx"; then
+            ANY_STEP_FAILED=1
+            if [ "$FAIL_FAST" -eq 1 ]; then
+                break
+            fi
+        fi
+        log ""
+        step_num=$((step_num + 1))
+    done
 }
 
 # Parallel scheduler: launch the parallelizable steps in the background, run the
@@ -548,7 +648,12 @@ run_steps_parallel() {
     local -a bg_idx=()
     local -a bg_pid=()
 
-    tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/update-all-mac-parallel.XXXXXX")
+    tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/update-all-mac-parallel.XXXXXX" 2>/dev/null) || tmp_root=""
+    if [ -z "$tmp_root" ]; then
+        log "${YELLOW}⚠️  Could not create a temp dir for parallel mode; running steps sequentially.${NC}"
+        run_steps_sequential "$total_steps"
+        return
+    fi
 
     num=1
     for idx in "${RUN_STEP_INDEXES[@]}"; do
@@ -639,7 +744,7 @@ repair_cask() {
     fi
 
     log "${YELLOW}  ⚠️  reinstall failed for $cask; trying uninstall --force + install${NC}"
-    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew uninstall --cask --force "$cask" >/dev/null 2>&1 || true
+    run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew uninstall --cask --force "$cask" || true
 
     if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --cask "$cask"; then
         return 0
@@ -721,8 +826,37 @@ brew_cask_upgrade() {
 # === Homebrew update ===
 update_homebrew() {
     if ! command -v brew >/dev/null 2>&1; then
-        log "${YELLOW}  → Homebrew is not installed; skipping${NC}"
-        return "$STEP_SKIP"
+        if [ "$INSTALL_HOMEBREW" -ne 1 ]; then
+            log "${YELLOW}  → Homebrew is not installed; skipping${NC}"
+            log "  ${YELLOW}→ Re-run with --install-homebrew to bootstrap it${NC}"
+            return "$STEP_SKIP"
+        fi
+
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "  ${BLUE}[dry-run] would install Homebrew${NC}"
+            return "$STEP_SKIP"
+        fi
+
+        if ! command -v curl >/dev/null 2>&1; then
+            log "${RED}  ⚠️  curl is required to install Homebrew${NC}"
+            return "$STEP_FAIL"
+        fi
+
+        log "  → Homebrew is not installed; installing it..."
+        if ! run_logged env NONINTERACTIVE=1 /bin/bash -c \
+            "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+            log "${RED}  ⚠️  Homebrew installation failed${NC}"
+            return "$STEP_FAIL"
+        fi
+
+        # Make the freshly installed brew usable for the rest of this run.
+        setup_path
+        eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null || true)"
+        if ! command -v brew >/dev/null 2>&1; then
+            log "${RED}  ⚠️  Homebrew installed but 'brew' is still not on PATH${NC}"
+            return "$STEP_FAIL"
+        fi
+        log "  ${GREEN}→ Homebrew installed${NC}"
     fi
 
     local had_error=0
@@ -741,7 +875,9 @@ update_homebrew() {
     local failed_casks=()
 
     log "  → Updating Homebrew metadata..."
-    if ! brew_update_catalog; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] skipping Homebrew catalog refresh${NC}"
+    elif ! brew_update_catalog; then
         log "${RED}  ⚠️  Could not update Homebrew indexes${NC}"
         had_error=1
     fi
@@ -757,6 +893,22 @@ update_homebrew() {
     while IFS= read -r line; do
         [ -n "$line" ] && outdated_casks+=("$line")
     done <<<"$outdated_casks_raw"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if [ ${#outdated_formulae[@]} -gt 0 ]; then
+            log "  ${YELLOW}[dry-run] would upgrade ${#outdated_formulae[@]} formula(e):${NC}"
+            log "$outdated_formulae_raw"
+        else
+            log "  ${GREEN}→ All formulae are up to date${NC}"
+        fi
+        if [ ${#outdated_casks[@]} -gt 0 ]; then
+            log "  ${YELLOW}[dry-run] would upgrade ${#outdated_casks[@]} cask(s):${NC}"
+            log "$outdated_casks_raw"
+        else
+            log "  ${GREEN}→ All apps are up to date${NC}"
+        fi
+        return "$STEP_OK"
+    fi
 
     if [ ${#outdated_formulae[@]} -gt 0 ]; then
         log "  ${YELLOW}→ Outdated formulae found: ${#outdated_formulae[@]}${NC}"
@@ -883,6 +1035,12 @@ update_npm() {
     fi
 
     log "$outdated_output"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would run: npm update -g${NC}"
+        return "$STEP_OK"
+    fi
+
     log "  → Upgrading..."
 
     run_logged with_timeout "$NET_TIMEOUT" npm update -g "${npm_net[@]}"
@@ -932,28 +1090,34 @@ update_mas() {
         log "${RED}  ⚠️  Could not get the Mac App Store update list${NC}"
         log "  → $outdated_output"
         log "${YELLOW}     mas uses Spotlight; check App Store app indexing if this error repeats${NC}"
-        return 1
+        return "$STEP_FAIL"
     fi
 
     if [ -z "$outdated_output" ]; then
         log "  ${GREEN}→ No Mac App Store updates found${NC}"
-        return 0
+        return "$STEP_OK"
     fi
 
     log "$outdated_output"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would run: mas upgrade${NC}"
+        return "$STEP_OK"
+    fi
+
     log "  → Upgrading..."
 
     if run_logged mas update "$accuracy_arg"; then
-        return 0
+        return "$STEP_OK"
     fi
 
     # Fallback for older mas versions/aliases.
     if run_logged mas upgrade "$accuracy_arg"; then
-        return 0
+        return "$STEP_OK"
     fi
 
     log "${RED}  ⚠️  Could not update Mac App Store apps${NC}"
-    return 1
+    return "$STEP_FAIL"
 }
 
 # === Oh My Zsh update ===
@@ -965,22 +1129,27 @@ update_ohmyzsh() {
         return "$STEP_SKIP"
     fi
 
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would update Oh My Zsh${NC}"
+        return "$STEP_OK"
+    fi
+
     if [ -x "$zsh_root/tools/upgrade.sh" ]; then
         log "  → Updating with bundled upgrade.sh..."
         if ! run_logged env ZSH="$zsh_root" DISABLE_UPDATE_PROMPT=true "$zsh_root/tools/upgrade.sh" -v silent; then
             log "${RED}  ⚠️  Oh My Zsh update failed${NC}"
-            return 1
+            return "$STEP_FAIL"
         fi
-        return 0
+        return "$STEP_OK"
     fi
 
     log "  → tools/upgrade.sh not found; using git pull..."
     if ! run_logged git -C "$zsh_root" pull --ff-only; then
         log "${RED}  ⚠️  Oh My Zsh update through git failed${NC}"
-        return 1
+        return "$STEP_FAIL"
     fi
 
-    return 0
+    return "$STEP_OK"
 }
 
 # === pip check ===
@@ -999,7 +1168,7 @@ check_pip() {
     log "  → pip version: $pip_version"
     log "  ${GREEN}→ Update pip together with the Python installation you use${NC}"
 
-    return 0
+    return "$STEP_OK"
 }
 
 # === pipx update ===
@@ -1014,6 +1183,11 @@ update_pipx() {
 
     if [ "$PIPX_INCLUDE_INJECTED" -eq 1 ] && pipx upgrade-all --help 2>/dev/null | grep -q -- '--include-injected'; then
         args+=(--include-injected)
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would run: pipx ${args[*]}${NC}"
+        return "$STEP_OK"
     fi
 
     if ! run_logged pipx "${args[@]}"; then
@@ -1041,6 +1215,11 @@ update_uv() {
     if ! command -v uv >/dev/null 2>&1; then
         log "  ${YELLOW}→ uv is not installed; skipping${NC}"
         return "$STEP_SKIP"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would update uv and its installed tools${NC}"
+        return "$STEP_OK"
     fi
 
     local had_warn=0
@@ -1111,6 +1290,123 @@ update_uv() {
     fi
 
     return "$STEP_OK"
+}
+
+# === Rust (rustup + cargo) update ===
+update_rust() {
+    if ! command -v rustup >/dev/null 2>&1 && ! command -v cargo >/dev/null 2>&1; then
+        log "  ${YELLOW}→ rustup/cargo are not installed; skipping${NC}"
+        return "$STEP_SKIP"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would run: rustup update / cargo install-update -a${NC}"
+        return "$STEP_OK"
+    fi
+
+    local had_warn=0
+
+    if command -v rustup >/dev/null 2>&1; then
+        log "  → Updating Rust toolchains..."
+        if ! run_logged rustup update; then
+            log "${RED}  ⚠️  rustup update failed${NC}"
+            return "$STEP_FAIL"
+        fi
+    fi
+
+    # `cargo install-update` (from the cargo-update crate) upgrades globally
+    # installed crates; it is optional, so only run it when present.
+    if command -v cargo >/dev/null 2>&1 && command -v cargo-install-update >/dev/null 2>&1; then
+        log "  → Updating cargo-installed crates..."
+        if ! run_logged cargo install-update -a; then
+            log "${YELLOW}  ⚠️  cargo install-update completed with warnings${NC}"
+            had_warn=1
+        fi
+    fi
+
+    if [ "$had_warn" -ne 0 ]; then
+        return "$STEP_WARN"
+    fi
+
+    return "$STEP_OK"
+}
+
+# === mise update ===
+update_mise() {
+    if ! command -v mise >/dev/null 2>&1; then
+        log "  ${YELLOW}→ mise is not installed; skipping${NC}"
+        return "$STEP_SKIP"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would run: mise upgrade${NC}"
+        return "$STEP_OK"
+    fi
+
+    log "  → Upgrading mise-managed tools..."
+    if ! run_logged mise upgrade; then
+        log "${RED}  ⚠️  mise upgrade failed${NC}"
+        return "$STEP_FAIL"
+    fi
+
+    return "$STEP_OK"
+}
+
+# === asdf update ===
+update_asdf() {
+    if ! command -v asdf >/dev/null 2>&1; then
+        log "  ${YELLOW}→ asdf is not installed; skipping${NC}"
+        return "$STEP_SKIP"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would run: asdf plugin update --all${NC}"
+        return "$STEP_OK"
+    fi
+
+    # Refresh plugin definitions. Bumping installed tool versions is left to the
+    # user, since asdf has no safe "upgrade everything to latest" operation.
+    log "  → Updating asdf plugins..."
+    if ! run_logged asdf plugin update --all; then
+        log "${YELLOW}  ⚠️  asdf plugin update completed with warnings${NC}"
+        return "$STEP_WARN"
+    fi
+
+    return "$STEP_OK"
+}
+
+# === gcloud components update ===
+update_gcloud() {
+    if ! command -v gcloud >/dev/null 2>&1; then
+        log "  ${YELLOW}→ gcloud is not installed; skipping${NC}"
+        return "$STEP_SKIP"
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "  ${BLUE}[dry-run] would run: gcloud components update${NC}"
+        return "$STEP_OK"
+    fi
+
+    local output=""
+    local rc=0
+
+    log "  → Updating gcloud components..."
+    output=$(gcloud components update --quiet 2>&1)
+    rc=$?
+    [ -n "$output" ] && log "$output"
+
+    if [ "$rc" -eq 0 ]; then
+        return "$STEP_OK"
+    fi
+
+    # Homebrew (and some managed) installs disable the component manager.
+    if printf '%s\n' "$output" | grep -qiE 'component manager is disabled|managed by|cannot perform this action'; then
+        log "  ${YELLOW}→ gcloud components are managed by your installer; skipping${NC}"
+        return "$STEP_SKIP"
+    fi
+
+    log "${RED}  ⚠️  gcloud components update failed${NC}"
+    return "$STEP_FAIL"
 }
 
 # === macOS update check ===
@@ -1208,6 +1504,11 @@ if [ "$LIST_STEPS" -eq 1 ]; then
     print_steps
     exit 0
 fi
+
+if [ "$DOCTOR" -eq 1 ]; then
+    print_doctor
+    exit 0
+fi
 init_step_selection
 
 validate_lock_dir
@@ -1225,6 +1526,11 @@ log ""
 log "${YELLOW}Started at: $DATE${NC}"
 log ""
 
+if [ "$DRY_RUN" -eq 1 ]; then
+    log "${YELLOW}🧪 DRY RUN — no changes will be made${NC}"
+    log ""
+fi
+
 run_total=${#RUN_STEP_INDEXES[@]}
 ANY_STEP_FAILED=0
 ANY_STEP_WARN=0
@@ -1232,17 +1538,7 @@ ANY_STEP_WARN=0
 if [ "$PARALLEL" -eq 1 ]; then
     run_steps_parallel "$run_total"
 else
-    step_num=1
-    for step_idx in "${RUN_STEP_INDEXES[@]}"; do
-        if ! run_step "$step_num" "$run_total" "$step_idx"; then
-            ANY_STEP_FAILED=1
-            if [ "$FAIL_FAST" -eq 1 ]; then
-                break
-            fi
-        fi
-        log ""
-        step_num=$((step_num + 1))
-    done
+    run_steps_sequential "$run_total"
 fi
 
 print_summary

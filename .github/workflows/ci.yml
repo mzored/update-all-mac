@@ -48,6 +48,18 @@ jobs:
       - name: Run parallel steps test
         run: tests/parallel_steps_test.sh
 
+      - name: Run malloc noise filter test
+        run: tests/malloc_noise_filter_test.sh
+
+      - name: Run dry-run test
+        run: tests/dry_run_test.sh
+
+      - name: Run doctor test
+        run: tests/doctor_test.sh
+
+      - name: Run extra manager test
+        run: tests/extra_manager_test.sh
+
       - name: Check Homebrew formula
         run: |
           ruby -c Formula/update-all-mac.rb
