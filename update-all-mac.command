@@ -3,8 +3,8 @@
 # Full macOS app and package updater
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
-# Date: 2026-07-01
-# Version: 3.3.0
+# Date: 2026-07-22
+# Version: 3.3.1
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -865,11 +865,14 @@ update_homebrew() {
     local cask=""
     local outdated_formulae_raw=""
     local outdated_casks_raw=""
+    local pinned_packages_raw=""
     local remaining_casks_raw=""
     local final_casks_raw=""
     local app_path=""
     local outdated_formulae=()
     local outdated_casks=()
+    local upgradeable_formulae=()
+    local upgradeable_casks=()
     local casks_to_upgrade=()
     local pre_repair_casks=()
     local failed_casks=()
@@ -885,6 +888,7 @@ update_homebrew() {
     log "  → Checking for outdated packages..."
     outdated_formulae_raw=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet 2>/dev/null || true)
     outdated_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
+    pinned_packages_raw=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew list --pinned 2>/dev/null || true)
 
     while IFS= read -r line; do
         [ -n "$line" ] && outdated_formulae+=("$line")
@@ -894,40 +898,68 @@ update_homebrew() {
         [ -n "$line" ] && outdated_casks+=("$line")
     done <<<"$outdated_casks_raw"
 
+    if [ ${#outdated_formulae[@]} -gt 0 ]; then
+        for line in "${outdated_formulae[@]}"; do
+            if printf '%s\n' "$pinned_packages_raw" | grep -Fxq "$line"; then
+                log "  ${YELLOW}→ Skipping pinned formula: $line${NC}"
+            else
+                upgradeable_formulae+=("$line")
+            fi
+        done
+    fi
+
+    if [ ${#outdated_casks[@]} -gt 0 ]; then
+        for cask in "${outdated_casks[@]}"; do
+            if printf '%s\n' "$pinned_packages_raw" | grep -Fxq "$cask"; then
+                log "  ${YELLOW}→ Skipping pinned cask: $cask${NC}"
+            else
+                upgradeable_casks+=("$cask")
+            fi
+        done
+    fi
+
     if [ "$DRY_RUN" -eq 1 ]; then
-        if [ ${#outdated_formulae[@]} -gt 0 ]; then
-            log "  ${YELLOW}[dry-run] would upgrade ${#outdated_formulae[@]} formula(e):${NC}"
-            log "$outdated_formulae_raw"
+        if [ ${#upgradeable_formulae[@]} -gt 0 ]; then
+            log "  ${YELLOW}[dry-run] would upgrade ${#upgradeable_formulae[@]} formula(e):${NC}"
+            for line in "${upgradeable_formulae[@]}"; do
+                log "$line"
+            done
         else
-            log "  ${GREEN}→ All formulae are up to date${NC}"
+            log "  ${GREEN}→ No unpinned outdated formulae to upgrade${NC}"
         fi
-        if [ ${#outdated_casks[@]} -gt 0 ]; then
-            log "  ${YELLOW}[dry-run] would upgrade ${#outdated_casks[@]} cask(s):${NC}"
-            log "$outdated_casks_raw"
+        if [ ${#upgradeable_casks[@]} -gt 0 ]; then
+            log "  ${YELLOW}[dry-run] would upgrade ${#upgradeable_casks[@]} cask(s):${NC}"
+            for cask in "${upgradeable_casks[@]}"; do
+                log "$cask"
+            done
         else
-            log "  ${GREEN}→ All apps are up to date${NC}"
+            log "  ${GREEN}→ No unpinned outdated apps to upgrade${NC}"
         fi
         return "$STEP_OK"
     fi
 
-    if [ ${#outdated_formulae[@]} -gt 0 ]; then
-        log "  ${YELLOW}→ Outdated formulae found: ${#outdated_formulae[@]}${NC}"
-        log "$outdated_formulae_raw"
-        if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula "${outdated_formulae[@]}"; then
+    if [ ${#upgradeable_formulae[@]} -gt 0 ]; then
+        log "  ${YELLOW}→ Unpinned outdated formulae found: ${#upgradeable_formulae[@]}${NC}"
+        for line in "${upgradeable_formulae[@]}"; do
+            log "$line"
+        done
+        if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula "${upgradeable_formulae[@]}"; then
             log "${RED}  ⚠️  Error while upgrading formulae${NC}"
             had_error=1
         fi
     else
-        log "  ${GREEN}→ All formulae are up to date${NC}"
+        log "  ${GREEN}→ No unpinned outdated formulae to upgrade${NC}"
     fi
 
     # Bash 3.2 (default on macOS) + `set -u`: empty "${arr[@]}" triggers "unbound variable".
-    if [ ${#outdated_casks[@]} -gt 0 ]; then
-        check_running_apps "${outdated_casks[@]}"
-        log "  ${YELLOW}→ Outdated apps found: ${#outdated_casks[@]}${NC}"
-        log "$outdated_casks_raw"
+    if [ ${#upgradeable_casks[@]} -gt 0 ]; then
+        check_running_apps "${upgradeable_casks[@]}"
+        log "  ${YELLOW}→ Unpinned outdated apps found: ${#upgradeable_casks[@]}${NC}"
+        for cask in "${upgradeable_casks[@]}"; do
+            log "$cask"
+        done
 
-        for cask in "${outdated_casks[@]}"; do
+        for cask in "${upgradeable_casks[@]}"; do
             app_path=$(get_primary_cask_app_path "$cask")
             if [ -n "$app_path" ] && [ ! -e "$app_path" ]; then
                 pre_repair_casks+=("$cask")
@@ -968,14 +1000,14 @@ update_homebrew() {
         fi
 
         final_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
-        for cask in "${outdated_casks[@]}"; do
+        for cask in "${upgradeable_casks[@]}"; do
             if printf '%s\n' "$final_casks_raw" | grep -Fxq "$cask"; then
                 log "${RED}  ⚠️  Cask is still outdated after upgrade attempt: $cask${NC}"
                 had_error=1
             fi
         done
     else
-        log "  ${GREEN}→ All apps are up to date${NC}"
+        log "  ${GREEN}→ No unpinned outdated apps to upgrade${NC}"
     fi
 
     log "  → Cleaning cache..."

@@ -30,6 +30,12 @@ jobs:
       - name: Run behavior tests
         run: tests/uv_homebrew_only_test.sh
 
+      - name: Run pinned Homebrew package tests
+        run: |
+          tests/homebrew_pinned_formula_test.sh
+          tests/homebrew_pinned_cask_test.sh
+          tests/homebrew_no_outdated_casks_test.sh
+
       - name: Run uv detection regression test
         run: tests/uv_homebrew_direct_detection_test.sh
 

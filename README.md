@@ -210,6 +210,10 @@ without refreshing the Homebrew catalog or changing anything. `--doctor` prints 
 tools detected on the current Mac and their versions, then exits. `--install-homebrew`
 installs Homebrew non-interactively when it is missing (opt-in bootstrap for a new Mac).
 
+Homebrew formulae and casks pinned with `brew pin` are intentionally skipped. They are
+reported in the run log but do not make the Homebrew step fail; all unpinned outdated
+packages continue to update normally.
+
 ## Environment Variables
 
 Every CLI option has an environment-friendly path for automation:
