@@ -9,7 +9,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
-mkdir -p "$tmp_dir/bin" "$tmp_dir/home" "$tmp_dir/state"
+mkdir -p "$tmp_dir/bin" "$tmp_dir/home" "$tmp_dir/state" "$tmp_dir/caskroom/alt-tab/1.0.upgrading"
 calls_file="$tmp_dir/calls.log"
 outdated_count_file="$tmp_dir/state/outdated-count"
 run_log="$tmp_dir/run.log"
@@ -25,6 +25,10 @@ case "$*" in
         exit 0
         ;;
     "outdated --formula --quiet")
+        exit 0
+        ;;
+    "--caskroom")
+        printf '%s\n' "$CASKROOM"
         exit 0
         ;;
     "outdated --cask --quiet")
@@ -69,6 +73,7 @@ chmod +x "$tmp_dir/bin/brew"
 
 if ! CALLS_FILE="$calls_file" \
     OUTDATED_COUNT_FILE="$outdated_count_file" \
+    CASKROOM="$tmp_dir/caskroom" \
     PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
     HOME="$tmp_dir/home" \
     UPDATE_ALL_NO_PAUSE=1 \
@@ -96,6 +101,12 @@ fi
 
 if ! grep -Fq 'Skipping pinned cask: alt-tab' "$run_log"; then
     printf 'Expected the log to explain that the pinned cask was skipped.\n' >&2
+    cat "$run_log" >&2
+    exit 1
+fi
+
+if ! grep -Fq 'Skipping pinned interrupted cask: alt-tab' "$run_log"; then
+    printf 'Expected a pinned interrupted cask to remain pinned and skipped.\n' >&2
     cat "$run_log" >&2
     exit 1
 fi

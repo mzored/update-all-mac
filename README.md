@@ -241,10 +241,12 @@ If Homebrew finds a cask directory ending in `.upgrading`, the script reports th
 interrupted upgrade and includes it in the same cask batch as ordinary app updates. This
 normally limits Homebrew to one password dialog because Homebrew deliberately resets its
 `sudo` timestamp for each separate process. A separate `brew reinstall --cask` runs only
-if the combined batch cannot recover an app; the terminal and password dialog identify
-that fallback before any additional password request. After a successful reinstall the
-script removes that exact stale `.upgrading` directory. Forced uninstall remains disabled
-unless `--force-cask-repair` is explicitly used.
+if the combined batch cannot recover one or more apps; all such apps are retried together
+to limit the fallback to one additional Homebrew request. The terminal and password dialog
+identify that fallback before it starts. Homebrew confirmation prompts are disabled for
+these unattended operations. After a successful reinstall the script removes that exact
+stale `.upgrading` directory. Forced uninstall remains disabled unless
+`--force-cask-repair` is explicitly used.
 
 Homebrew formulae and casks pinned with `brew pin` are intentionally skipped. They are
 reported in the run log but do not make the Homebrew step fail; all unpinned outdated

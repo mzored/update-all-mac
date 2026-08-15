@@ -27,16 +27,14 @@ old_file="$tmp_dir/system-tmp/update-all-mac.old-file"
 recent_file="$tmp_dir/system-tmp/update-all-mac.recent-file"
 old_dir="$tmp_dir/system-tmp/update-all-mac-parallel.old-dir"
 recent_dir="$tmp_dir/system-tmp/update-all-mac-parallel.recent-dir"
-recent_empty_run_dir="$tmp_dir/system-tmp/update-all-mac-run.recent-empty"
 protected_log="$tmp_dir/system-tmp/update-all-mac.log"
 protected_rotated_log="$protected_log.1"
 : >"$old_file"
 : >"$recent_file"
 : >"$protected_log"
 : >"$protected_rotated_log"
-mkdir -p "$old_dir" "$recent_dir" "$recent_empty_run_dir"
+mkdir -p "$old_dir" "$recent_dir"
 touch -t 202001010000 "$old_file" "$old_dir" "$protected_log" "$protected_rotated_log"
-touch -t "$(date -v-2M '+%Y%m%d%H%M.%S')" "$recent_empty_run_dir"
 
 CALLS_FILE="$calls_file" \
     TMPDIR="$tmp_dir/system-tmp" \
@@ -63,11 +61,6 @@ fi
 
 if [ ! -e "$recent_file" ] || [ ! -e "$recent_dir" ]; then
     printf 'Recent updater-owned temp artifacts must be preserved.\n' >&2
-    exit 1
-fi
-
-if [ -e "$recent_empty_run_dir" ]; then
-    printf 'Empty updater runtime directories are safe garbage after lock acquisition.\n' >&2
     exit 1
 fi
 

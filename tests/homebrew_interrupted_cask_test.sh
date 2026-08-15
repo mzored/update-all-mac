@@ -54,14 +54,17 @@ case "$*" in
     "info --cask regular-app")
         exit 0
         ;;
-    "upgrade --cask --greedy broken-app regular-app")
+    "upgrade --cask broken-app regular-app")
+        printf '%s\n' "${HOMEBREW_UPGRADE_GREEDY_CASKS:-}" >"$GREEDY_CAPTURE"
         rm -rf "$CASKROOM/broken-app/1.0.upgrading"
         exit 0
         ;;
-    "upgrade --cask --greedy stubborn-app")
+    "upgrade --cask stubborn-app")
+        printf '%s\n' "${HOMEBREW_UPGRADE_GREEDY_CASKS:-}" >"$GREEDY_CAPTURE"
         exit 1
         ;;
     "reinstall --cask stubborn-app")
+        printf '%s\n' "${UPDATE_ALL_ASKPASS_CONTEXT:-}" >"$REPAIR_CONTEXT_CAPTURE"
         exit 0
         ;;
     "upgrade --formula formula-one")
@@ -86,6 +89,8 @@ chmod +x "$tmp_dir/bin/brew" "$tmp_dir/bin/rm"
 
 CALLS_FILE="$calls_file" \
     CASKROOM="$tmp_dir/caskroom" \
+    GREEDY_CAPTURE="$tmp_dir/greedy.txt" \
+    REPAIR_CONTEXT_CAPTURE="$tmp_dir/unused-context.txt" \
     OUTDATED_COUNT_FILE="$outdated_count_file" \
     PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
     HOME="$tmp_dir/home" \
@@ -96,19 +101,25 @@ CALLS_FILE="$calls_file" \
     --lock-dir "$tmp_dir/lock" \
     --only homebrew >/dev/null 2>&1
 
-if ! grep -Fxq 'brew upgrade --cask --greedy broken-app regular-app' "$calls_file"; then
+if ! grep -Fxq 'brew upgrade --cask broken-app regular-app' "$calls_file"; then
     printf 'Expected interrupted and ordinary casks in one Homebrew batch.\n' >&2
     cat "$calls_file" >&2
     exit 1
 fi
 
-repair_line=$(grep -nFx 'brew upgrade --cask --greedy broken-app regular-app' "$calls_file" | cut -d: -f1)
+repair_line=$(grep -nFx 'brew upgrade --cask broken-app regular-app' "$calls_file" | cut -d: -f1)
 cask_line="$repair_line"
 formula_line=$(grep -nFx 'brew upgrade --formula formula-one' "$calls_file" | cut -d: -f1)
 
 if [ "$cask_line" -ge "$formula_line" ]; then
     printf 'Expected the combined cask batch before the formula upgrade.\n' >&2
     cat "$calls_file" >&2
+    exit 1
+fi
+
+if [ "$(cat "$tmp_dir/greedy.txt")" != 'broken-app' ]; then
+    printf 'Only the interrupted token should be greedy in the combined batch.\n' >&2
+    cat "$tmp_dir/greedy.txt" >&2
     exit 1
 fi
 
@@ -130,8 +141,11 @@ if [ -d "$tmp_dir/caskroom/broken-app/1.0.upgrading" ]; then
 fi
 
 mkdir -p "$tmp_dir/caskroom/stubborn-app/2.0.upgrading/Stubborn.app"
+: >"$calls_file"
 if ! CALLS_FILE="$calls_file" \
     CASKROOM="$tmp_dir/caskroom" \
+    GREEDY_CAPTURE="$tmp_dir/stubborn-greedy.txt" \
+    REPAIR_CONTEXT_CAPTURE="$tmp_dir/stubborn-context.txt" \
     OUTDATED_COUNT_FILE="$outdated_count_file" \
     PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
     HOME="$tmp_dir/home" \
@@ -142,6 +156,26 @@ if ! CALLS_FILE="$calls_file" \
     --lock-dir "$tmp_dir/stubborn-lock" \
     --only homebrew >/dev/null 2>&1; then
     printf 'A successful reinstall must not fail only because marker cleanup was denied.\n' >&2
+    exit 1
+fi
+
+if [ "$(grep -Ec '^brew (upgrade|reinstall|install|uninstall) --cask' "$calls_file")" -ne 2 ]; then
+    printf 'Exceptional recovery should use one failed batch and one reinstall batch.\n' >&2
+    cat "$calls_file" >&2
+    exit 1
+fi
+
+notice_line=$(grep -nF 'one additional password dialog may appear' "$tmp_dir/stubborn.log" | head -n1 | cut -d: -f1)
+repair_log_line=$(grep -nF 'Repairing cask batch: 1 app(s)' "$tmp_dir/stubborn.log" | head -n1 | cut -d: -f1)
+if [ -z "$notice_line" ] || [ -z "$repair_log_line" ] || [ "$notice_line" -ge "$repair_log_line" ]; then
+    printf 'Fallback password notice must precede the separate reinstall batch.\n' >&2
+    cat "$tmp_dir/stubborn.log" >&2
+    exit 1
+fi
+
+if ! grep -Fq 'additional recovery request' "$tmp_dir/stubborn-context.txt"; then
+    printf 'Fallback askpass context must explain why another password is requested.\n' >&2
+    cat "$tmp_dir/stubborn-context.txt" >&2
     exit 1
 fi
 

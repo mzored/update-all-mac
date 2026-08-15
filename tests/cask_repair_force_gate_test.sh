@@ -18,7 +18,10 @@ printf 'brew %s\n' "$*" >>"$CALLS_FILE"
 case "$*" in
     "help update-if-needed" | "update-if-needed" | "outdated --formula --quiet" | "outdated --cask --quiet" | "list --pinned") exit 0 ;;
     "--caskroom") printf '%s\n' "$CASKROOM" ;;
-    "upgrade --cask --greedy guarded-app") exit 1 ;;
+    "upgrade --cask guarded-app")
+        [ "${HOMEBREW_UPGRADE_GREEDY_CASKS:-}" = 'guarded-app' ]
+        exit 1
+        ;;
     "reinstall --cask guarded-app") exit 1 ;;
     "uninstall --cask --force guarded-app") exit 0 ;;
     "install --cask guarded-app") exit 0 ;;
@@ -56,7 +59,7 @@ fi
 run_case forced --force-cask-repair
 
 for expected in \
-    'brew upgrade --cask --greedy guarded-app' \
+    'brew upgrade --cask guarded-app' \
     'brew reinstall --cask guarded-app' \
     'brew uninstall --cask --force guarded-app' \
     'brew install --cask guarded-app'; do

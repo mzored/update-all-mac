@@ -644,13 +644,6 @@ cleanup_stale_temp_artifacts() {
     [ -d "$temp_root" ] || return 0
     current_uid=$(id -u)
 
-    # Empty private run directories contain no recoverable diagnostics. Once
-    # they are older than one minute, they cannot belong to this just-started
-    # process and are safe to remove even before the general age threshold.
-    while IFS= read -r -d '' path; do
-        [ "$path" = "$RUN_TEMP_DIR" ] || rmdir "$path" 2>/dev/null || true
-    done < <(find "$temp_root" -maxdepth 1 -type d -user "$current_uid" -name 'update-all-mac-run.*' -empty -mmin +1 -print0 2>/dev/null)
-
     while IFS= read -r -d '' path; do
         case "$path" in
             "$LOG_FILE" | "$LOG_FILE.1") continue ;;
@@ -1011,34 +1004,59 @@ remove_interrupted_cask_markers() {
     done < <(find "$caskroom/$cask" -mindepth 1 -maxdepth 1 -type d -name '*.upgrading' -print0 2>/dev/null)
 }
 
-repair_cask() {
-    local cask="$1"
+repair_casks() {
+    local cask=""
+    local had_error=0
+    local remaining_casks_raw=""
+    local remaining_interrupted_raw=""
+    local force_casks=()
 
-    log "  → Repairing cask: $cask"
-    if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew reinstall --cask "$cask"; then
-        if ! remove_interrupted_cask_markers "$cask"; then
-            log "${YELLOW}  ⚠️  Cask was reinstalled, but its stale .upgrading directory could not be removed: $cask${NC}"
-        fi
+    [ "$#" -gt 0 ] || return 0
+    log "  → Repairing cask batch: $# app(s)"
+    if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1 brew reinstall --cask "$@"; then
+        for cask in "$@"; do
+            if ! remove_interrupted_cask_markers "$cask"; then
+                log "${YELLOW}  ⚠️  Cask was reinstalled, but its stale .upgrading directory could not be removed: $cask${NC}"
+            fi
+        done
         return 0
     fi
 
     if [ "$BREW_FORCE_CASK_REPAIR" -ne 1 ]; then
-        log "${YELLOW}  ⚠️  reinstall failed for $cask; forced removal is disabled${NC}"
+        log "${YELLOW}  ⚠️  Batch reinstall failed; forced removal is disabled${NC}"
         log "${YELLOW}     Use --force-cask-repair to enable the risky fallback${NC}"
         return 1
     fi
 
-    log "${YELLOW}  ⚠️  reinstall failed for $cask; trying uninstall --force + install${NC}"
-    run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew uninstall --cask --force "$cask" || true
-
-    if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --cask "$cask"; then
-        if ! remove_interrupted_cask_markers "$cask"; then
-            log "${YELLOW}  ⚠️  Cask was reinstalled, but its stale .upgrading directory could not be removed: $cask${NC}"
+    remaining_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
+    remaining_interrupted_raw=$(find_interrupted_casks)
+    for cask in "$@"; do
+        if printf '%s\n' "$remaining_casks_raw" | grep -Fxq "$cask" \
+            || printf '%s\n' "$remaining_interrupted_raw" | grep -Fxq "$cask" \
+            || cask_app_missing "$cask"; then
+            force_casks+=("$cask")
         fi
+    done
+
+    if [ ${#force_casks[@]} -eq 0 ]; then
+        log "${YELLOW}  ⚠️  Batch reinstall reported an error, but all apps now appear recovered${NC}"
         return 0
     fi
 
-    return 1
+    for cask in "${force_casks[@]}"; do
+        log "${YELLOW}  ⚠️  Reinstall failed for $cask; trying uninstall --force + install${NC}"
+        run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1 brew uninstall --cask --force "$cask" || true
+
+        if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1 brew install --cask "$cask"; then
+            if ! remove_interrupted_cask_markers "$cask"; then
+                log "${YELLOW}  ⚠️  Cask was reinstalled, but its stale .upgrading directory could not be removed: $cask${NC}"
+            fi
+        else
+            had_error=1
+        fi
+    done
+
+    [ "$had_error" -eq 0 ]
 }
 
 check_running_apps() {
@@ -1102,15 +1120,16 @@ brew_cask_outdated() {
 }
 
 brew_cask_upgrade() {
-    local recover_interrupted="$1"
+    local interrupted_greedy_casks="$1"
     shift
     local args=(--cask)
 
-    if [ "$BREW_GREEDY_CASKS" -eq 1 ] || [ "$recover_interrupted" -eq 1 ]; then
+    if [ "$BREW_GREEDY_CASKS" -eq 1 ]; then
         args+=(--greedy)
     fi
 
-    run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1 brew upgrade "${args[@]}" "$@"
+    run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1 \
+        HOMEBREW_UPGRADE_GREEDY_CASKS="$interrupted_greedy_casks" brew upgrade "${args[@]}" "$@"
 }
 
 # === Homebrew update ===
@@ -1159,8 +1178,8 @@ update_homebrew() {
     local remaining_casks_raw=""
     local final_casks_raw=""
     local remaining_interrupted_raw=""
-    local recover_interrupted=0
     local already_retried=0
+    local interrupted_greedy_casks=""
     local outdated_formulae=()
     local outdated_casks=()
     local upgradeable_formulae=()
@@ -1169,6 +1188,8 @@ update_homebrew() {
     local merged_casks=()
     local failed_casks=()
     local interrupted_casks=()
+    local recoverable_interrupted_casks=()
+    local marker_retry_casks=()
 
     log "  → Updating Homebrew metadata..."
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -1221,11 +1242,21 @@ update_homebrew() {
         done
     fi
 
+    if [ ${#interrupted_casks[@]} -gt 0 ]; then
+        for cask in "${interrupted_casks[@]}"; do
+            if printf '%s\n' "$pinned_packages_raw" | grep -Fxq "$cask"; then
+                log "  ${YELLOW}→ Skipping pinned interrupted cask: $cask (unpin it to recover)${NC}"
+            else
+                recoverable_interrupted_casks+=("$cask")
+            fi
+        done
+    fi
+
     # Put interrupted casks first, then merge the ordinary outdated set without
     # duplicates. One Homebrew process means one sudo timestamp reset and, in
     # the normal recovery path, a single password dialog for the whole batch.
-    if [ ${#interrupted_casks[@]} -gt 0 ]; then
-        for cask in "${interrupted_casks[@]}"; do
+    if [ ${#recoverable_interrupted_casks[@]} -gt 0 ]; then
+        for cask in "${recoverable_interrupted_casks[@]}"; do
             merged_casks+=("$cask")
         done
     fi
@@ -1271,16 +1302,16 @@ update_homebrew() {
 
         casks_to_upgrade=("${upgradeable_casks[@]}")
 
-        if [ ${#interrupted_casks[@]} -gt 0 ]; then
-            recover_interrupted=1
+        if [ ${#recoverable_interrupted_casks[@]} -gt 0 ]; then
+            interrupted_greedy_casks="${recoverable_interrupted_casks[*]}"
             log "${BLUE}  🔐 One Homebrew password dialog may appear for the combined app batch.${NC}"
             log "${BLUE}     macOS may separately show an App Management notice when replacing apps.${NC}"
-            set_password_context "Homebrew will recover ${#interrupted_casks[@]} interrupted app(s) and update ${#casks_to_upgrade[@]} app(s) in one operation. Your password is sent only to sudo and is not stored by update-all-mac."
+            set_password_context "Homebrew will recover ${#recoverable_interrupted_casks[@]} interrupted app(s) and update ${#casks_to_upgrade[@]} app(s) in one operation. Your password is sent only to sudo and is not stored by update-all-mac."
         else
             set_password_context "Homebrew will update ${#casks_to_upgrade[@]} app(s) in /Applications. Your password is sent only to sudo and is not stored by update-all-mac."
         fi
 
-        if [ ${#casks_to_upgrade[@]} -gt 0 ] && ! brew_cask_upgrade "$recover_interrupted" "${casks_to_upgrade[@]}"; then
+        if [ ${#casks_to_upgrade[@]} -gt 0 ] && ! brew_cask_upgrade "$interrupted_greedy_casks" "${casks_to_upgrade[@]}"; then
             log "${YELLOW}  ⚠️  Some casks did not upgrade. Trying to repair the failed casks...${NC}"
 
             remaining_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
@@ -1295,36 +1326,37 @@ update_homebrew() {
             done
 
             if [ ${#failed_casks[@]} -gt 0 ]; then
-                for cask in "${failed_casks[@]}"; do
-                    log "${YELLOW}  🔐 Homebrew is retrying $cask separately; one additional password dialog may appear.${NC}"
-                    set_password_context "The combined Homebrew update could not finish $cask. Homebrew is retrying this app separately, so this is an additional recovery request. Your password is sent only to sudo and is not stored by update-all-mac."
-                    if ! repair_cask "$cask"; then
-                        log "${RED}  ⚠️  Could not repair cask: $cask${NC}"
-                        had_error=1
-                    fi
-                done
+                log "${YELLOW}  🔐 Homebrew is retrying ${#failed_casks[@]} app(s) in one recovery batch; one additional password dialog may appear.${NC}"
+                set_password_context "The combined Homebrew update could not finish ${#failed_casks[@]} app(s). Homebrew is retrying them in one batch, so this is one additional recovery request. Your password is sent only to sudo and is not stored by update-all-mac."
+                if ! repair_casks "${failed_casks[@]}"; then
+                    log "${RED}  ⚠️  Could not repair every failed cask${NC}"
+                    had_error=1
+                fi
             fi
         fi
 
         # A command can exit successfully while an auto-updating cask remains
         # in its interrupted marker. Retry only those exceptional cases.
-        if [ ${#interrupted_casks[@]} -gt 0 ]; then
+        if [ ${#recoverable_interrupted_casks[@]} -gt 0 ]; then
             remaining_interrupted_raw=$(find_interrupted_casks)
-            for cask in "${interrupted_casks[@]}"; do
+            for cask in "${recoverable_interrupted_casks[@]}"; do
                 already_retried=0
                 if [ ${#failed_casks[@]} -gt 0 ] && printf '%s\n' "${failed_casks[@]}" | grep -Fxq "$cask"; then
                     already_retried=1
                 fi
                 if printf '%s\n' "$remaining_interrupted_raw" | grep -Fxq "$cask" \
                     && [ "$already_retried" -eq 0 ]; then
-                    log "${YELLOW}  🔐 Combined recovery left $cask interrupted; one additional password dialog may appear.${NC}"
-                    set_password_context "Homebrew left $cask interrupted after the combined update. It is retrying this app separately. Your password is sent only to sudo and is not stored by update-all-mac."
-                    if ! repair_cask "$cask"; then
-                        log "${RED}  ⚠️  Could not recover interrupted cask: $cask${NC}"
-                        had_error=1
-                    fi
+                    marker_retry_casks+=("$cask")
                 fi
             done
+            if [ ${#marker_retry_casks[@]} -gt 0 ]; then
+                log "${YELLOW}  🔐 Combined recovery left ${#marker_retry_casks[@]} app(s) interrupted; one additional password dialog may appear.${NC}"
+                set_password_context "Homebrew left ${#marker_retry_casks[@]} app(s) interrupted after the combined update. It is retrying them in one recovery batch. Your password is sent only to sudo and is not stored by update-all-mac."
+                if ! repair_casks "${marker_retry_casks[@]}"; then
+                    log "${RED}  ⚠️  Could not recover every interrupted cask${NC}"
+                    had_error=1
+                fi
+            fi
         fi
 
         final_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
@@ -1343,7 +1375,7 @@ update_homebrew() {
         for line in "${upgradeable_formulae[@]}"; do
             log_detail "$line"
         done
-        if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula "${upgradeable_formulae[@]}"; then
+        if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ASK=1 brew upgrade --formula "${upgradeable_formulae[@]}"; then
             log "${RED}  ⚠️  Error while upgrading formulae${NC}"
             had_error=1
         fi
