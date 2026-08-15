@@ -446,9 +446,9 @@ log_detail() {
     printf '%s\n' "$message" | strip_ansi >&9
 }
 
-# Run an external command, mirroring its combined output live to the terminal
-# and a color-stripped copy to the log file. Returns the command's own exit code
-# (not tee's), so callers can branch on success/failure as usual.
+# Run an external command, streaming a color-stripped copy to the log and, in
+# verbose mode, mirroring it to the terminal. Returns the command's own exit
+# code (not tee's), so callers can branch on success/failure as usual.
 run_logged() {
     local tmp="" rc=0
     local heartbeat_pid=""
@@ -487,7 +487,7 @@ run_logged() {
         printf '%s\n' "  ↳ Last command output (full details: $LOG_FILE):"
         tail -n 20 "$tmp"
     fi
-    LAST_COMMAND_RECLAIMED=$(sed -nE 's/.*free approximately ([^ ]+) of disk space.*/\1/p' "$tmp" 2>/dev/null | tail -n 1)
+    LAST_COMMAND_RECLAIMED=$(sed -nE 's/.*(has freed|would free) approximately ([^ ]+) of disk space.*/\2/p' "$tmp" 2>/dev/null | tail -n 1)
     rm -f "$tmp"
     return "$rc"
 }
@@ -499,6 +499,9 @@ start_heartbeat() {
     while sleep "$HEARTBEAT_SECONDS"; do
         elapsed=$((elapsed + HEARTBEAT_SECONDS))
         printf '  … Still working (%ss; details: %s)\n' "$elapsed" "$LOG_FILE"
+        if [ "$elapsed" -eq $((HEARTBEAT_SECONDS * 2)) ] && [ "$VERBOSE" -ne 1 ]; then
+            printf '  … Compact mode hides command output; if input is expected, check the log or retry with --verbose.\n'
+        fi
     done
 }
 
@@ -617,23 +620,26 @@ ensure_run_temp_dir() {
 cleanup_stale_temp_artifacts() {
     local temp_root="${TMPDIR:-/tmp}"
     local path=""
+    local current_uid=""
 
     [ "$DRY_RUN" -ne 1 ] || return 0
     [[ "$TEMP_MAX_AGE_MINUTES" =~ ^[1-9][0-9]*$ ]] || return 0
     temp_root=${temp_root%/}
     [ -d "$temp_root" ] || return 0
+    current_uid=$(id -u)
 
     while IFS= read -r -d '' path; do
+        [ "$path" != "$LOG_FILE" ] && [ "$path" != "$LOG_FILE.1" ] || continue
         case "${path##*/}" in
             update-all-mac.*) rm -f "$path" ;;
         esac
-    done < <(find "$temp_root" -maxdepth 1 -type f -name 'update-all-mac.*' -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
+    done < <(find "$temp_root" -maxdepth 1 -type f -user "$current_uid" -name 'update-all-mac.*' -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
 
     while IFS= read -r -d '' path; do
         case "${path##*/}" in
             update-all-mac-parallel.* | update-all-mac-run.*) rm -rf "$path" ;;
         esac
-    done < <(find "$temp_root" -maxdepth 1 -type d \( -name 'update-all-mac-parallel.*' -o -name 'update-all-mac-run.*' \) -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
+    done < <(find "$temp_root" -maxdepth 1 -type d -user "$current_uid" \( -name 'update-all-mac-parallel.*' -o -name 'update-all-mac-run.*' \) -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
 }
 
 setup_gui_password_prompt() {
@@ -656,6 +662,7 @@ setup_gui_password_prompt() {
     fi
 
     helper="$RUN_TEMP_DIR/askpass"
+    chmod 700 "$RUN_TEMP_DIR"
     printf '%s\n' \
         '#!/bin/bash' \
         'exec /usr/bin/osascript -e '\''text returned of (display dialog "update-all-mac needs administrator access" default answer "" with hidden answer buttons {"Cancel", "Continue"} default button "Continue" with icon caution)'\'' ' \
@@ -770,17 +777,18 @@ step_is_parallelizable() {
 run_step_worker() {
     local step_idx="$1"
     local seg="$2"
-    local rcfile="$3"
+    local logseg="$3"
+    local rcfile="$4"
     local step_func="${STEP_FUNCS[$step_idx]}"
 
     (
-        # Capture everything to the segment; discard the fd 9 log copy here so
-        # the shared log is written once, in order, at replay time.
+        # Keep terminal presentation separate from the complete log transport.
+        # This preserves compact output without losing command diagnostics.
         exec >"$seg" 2>&1
-        exec 9>/dev/null
-        # The segment is the parallel worker's replay transport. Force command
-        # details into it even when the parent uses compact terminal output.
-        VERBOSE=1
+        exec 9>"$logseg"
+        # The parent reports one heartbeat while it waits. Worker heartbeats
+        # would be stale by the time their captured segments are replayed.
+        HEARTBEAT_SECONDS=0
         "$step_func"
         printf '%s' "$?" >"$rcfile"
     )
@@ -792,12 +800,15 @@ emit_step_segment() {
     local total_steps="$2"
     local step_idx="$3"
     local seg="$4"
-    local rc="$5"
+    local logseg="$5"
+    local rc="$6"
 
     step_header "$step_num" "$total_steps" "$step_idx"
     if [ -s "$seg" ]; then
         filter_benign_noise <"$seg"
-        strip_ansi <"$seg" | filter_benign_noise >&9
+    fi
+    if [ -s "$logseg" ]; then
+        strip_ansi <"$logseg" | filter_benign_noise >&9
     fi
     step_status_from_rc "$step_idx" "$rc"
 }
@@ -829,10 +840,12 @@ run_steps_parallel() {
     local tmp_root=""
     local idx=""
     local seg=""
+    local logseg=""
     local rcfile=""
     local rc=0
     local num=0
     local i=0
+    local wait_heartbeat_pid=""
     local -a disp_num=()
     local -a bg_idx=()
     local -a bg_pid=()
@@ -856,10 +869,12 @@ run_steps_parallel() {
     for idx in "${RUN_STEP_INDEXES[@]}"; do
         if step_is_parallelizable "$idx"; then
             seg="$tmp_root/seg.$idx"
+            logseg="$tmp_root/log.$idx"
             rcfile="$tmp_root/rc.$idx"
             : >"$seg"
+            : >"$logseg"
             printf '%s' "$STEP_FAIL" >"$rcfile"
-            run_step_worker "$idx" "$seg" "$rcfile" &
+            run_step_worker "$idx" "$seg" "$logseg" "$rcfile" &
             bg_idx+=("$idx")
             bg_pid+=("$!")
         fi
@@ -883,9 +898,12 @@ run_steps_parallel() {
 
     # Wait for the background batch to finish.
     if [ "${#bg_pid[@]}" -gt 0 ]; then
+        start_heartbeat &
+        wait_heartbeat_pid=$!
         for i in "${!bg_pid[@]}"; do
             wait "${bg_pid[$i]}" 2>/dev/null || true
         done
+        stop_heartbeat "$wait_heartbeat_pid"
     fi
 
     # Replay background steps in canonical order.
@@ -894,10 +912,11 @@ run_steps_parallel() {
             continue
         fi
         seg="$tmp_root/seg.$idx"
+        logseg="$tmp_root/log.$idx"
         rcfile="$tmp_root/rc.$idx"
         rc=$(cat "$rcfile" 2>/dev/null || printf '%s' "$STEP_FAIL")
         [[ "$rc" =~ ^[0-9]+$ ]] || rc="$STEP_FAIL"
-        if ! emit_step_segment "${disp_num[idx]}" "$total_steps" "$idx" "$seg" "$rc"; then
+        if ! emit_step_segment "${disp_num[idx]}" "$total_steps" "$idx" "$seg" "$logseg" "$rc"; then
             ANY_STEP_FAILED=1
         fi
         log ""
@@ -938,12 +957,31 @@ find_interrupted_casks() {
     done < <(find "$caskroom" -mindepth 2 -maxdepth 2 -type d -name '*.upgrading' -print 2>/dev/null)
 }
 
+# Remove only Homebrew's exact per-cask scratch directories after a successful
+# reinstall. Keeping them would make every future run repeat the same repair.
+remove_interrupted_cask_markers() {
+    local cask="$1"
+    local caskroom=""
+    local marker=""
+
+    case "$cask" in
+        "" | .* | */*) return 1 ;;
+    esac
+    caskroom=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew --caskroom 2>/dev/null || true)
+    [ -d "$caskroom/$cask" ] || return 0
+
+    while IFS= read -r -d '' marker; do
+        rm -rf "$marker" || return 1
+    done < <(find "$caskroom/$cask" -mindepth 1 -maxdepth 1 -type d -name '*.upgrading' -print0 2>/dev/null)
+}
+
 repair_cask() {
     local cask="$1"
 
     log "  → Repairing cask: $cask"
     if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew reinstall --cask "$cask"; then
-        return 0
+        remove_interrupted_cask_markers "$cask"
+        return $?
     fi
 
     if [ "$BREW_FORCE_CASK_REPAIR" -ne 1 ]; then
@@ -956,7 +994,8 @@ repair_cask() {
     run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew uninstall --cask --force "$cask" || true
 
     if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --cask "$cask"; then
-        return 0
+        remove_interrupted_cask_markers "$cask"
+        return $?
     fi
 
     return 1

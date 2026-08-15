@@ -41,6 +41,7 @@ case "$*" in
         ;;
     "upgrade --cask regular-app")
         printf '%s\n' "${SUDO_ASKPASS:-}" >"$ASKPASS_CAPTURE"
+        { stat -f '%Lp' "$(dirname "$SUDO_ASKPASS")"; stat -f '%Lp' "$SUDO_ASKPASS"; } | paste -sd ' ' - >"$ASKPASS_MODE_CAPTURE"
         [ -n "${SUDO_ASKPASS:-}" ] && [ -x "$SUDO_ASKPASS" ]
         exit 0
         ;;
@@ -60,12 +61,14 @@ run_interactive_case() {
     local configured_askpass="${2:-}"
     local state_dir="$tmp_dir/$name-state"
     local capture="$tmp_dir/$name-askpass.txt"
+    local mode_capture="$tmp_dir/$name-askpass-mode.txt"
     mkdir -p "$state_dir"
 
     if [ -n "$configured_askpass" ]; then
         script -q /dev/null env \
             SUDO_ASKPASS="$configured_askpass" \
             ASKPASS_CAPTURE="$capture" \
+            ASKPASS_MODE_CAPTURE="$mode_capture" \
             CASKROOM="$tmp_dir/caskroom" \
             STATE_DIR="$state_dir" \
             PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
@@ -79,6 +82,7 @@ run_interactive_case() {
     else
         script -q /dev/null env \
             ASKPASS_CAPTURE="$capture" \
+            ASKPASS_MODE_CAPTURE="$mode_capture" \
             CASKROOM="$tmp_dir/caskroom" \
             STATE_DIR="$state_dir" \
             PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
@@ -97,6 +101,12 @@ generated_askpass=$(cat "$tmp_dir/generated-askpass.txt")
 
 if [ -z "$generated_askpass" ]; then
     printf 'Expected an interactive run to configure SUDO_ASKPASS.\n' >&2
+    exit 1
+fi
+
+if [ "$(cat "$tmp_dir/generated-askpass-mode.txt")" != '700 700' ]; then
+    printf 'Generated askpass directory and helper must both be mode 0700.\n' >&2
+    cat "$tmp_dir/generated-askpass-mode.txt" >&2
     exit 1
 fi
 

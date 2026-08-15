@@ -19,7 +19,7 @@ set -euo pipefail
 printf '%s %s\n' "$(basename "$0")" "$*" >>"$CALLS_FILE"
 case "$*" in
     "cleanup --help") printf '%s\n' '--scrub --prune=all' ;;
-    "cleanup --scrub" | "cleanup --prune=all") printf '%s\n' '==> This operation would free approximately 1.9GB of disk space.' ;;
+    "cleanup --scrub" | "cleanup --prune=all") printf '%s\n' '==> This operation has freed approximately 1.9GB of disk space.' ;;
     "cache --help") printf '%s\n' 'verify clean prune purge' ;;
     "cache prune --help" | "cache clean --help" | "cache purge --help" | "-m pip cache purge --help") exit 0 ;;
 esac

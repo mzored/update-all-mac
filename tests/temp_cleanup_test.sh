@@ -27,10 +27,14 @@ old_file="$tmp_dir/system-tmp/update-all-mac.old-file"
 recent_file="$tmp_dir/system-tmp/update-all-mac.recent-file"
 old_dir="$tmp_dir/system-tmp/update-all-mac-parallel.old-dir"
 recent_dir="$tmp_dir/system-tmp/update-all-mac-parallel.recent-dir"
+protected_log="$tmp_dir/system-tmp/update-all-mac.log"
+protected_rotated_log="$protected_log.1"
 : >"$old_file"
 : >"$recent_file"
+: >"$protected_log"
+: >"$protected_rotated_log"
 mkdir -p "$old_dir" "$recent_dir"
-touch -t 202001010000 "$old_file" "$old_dir"
+touch -t 202001010000 "$old_file" "$old_dir" "$protected_log" "$protected_rotated_log"
 
 CALLS_FILE="$calls_file" \
     TMPDIR="$tmp_dir/system-tmp" \
@@ -40,13 +44,18 @@ CALLS_FILE="$calls_file" \
     UPDATE_ALL_NO_PAUSE=1 \
     /bin/bash "$repo_root/update-all-mac.command" \
     --no-color \
-    --log-file "$tmp_dir/run.log" \
+    --log-file "$protected_log" \
     --lock-dir "$tmp_dir/lock" \
     --only npm >/dev/null 2>&1
 
 if [ -e "$old_file" ] || [ -e "$old_dir" ]; then
     printf 'Old updater-owned temp artifacts were not removed.\n' >&2
     find "$tmp_dir/system-tmp" -maxdepth 1 -print >&2
+    exit 1
+fi
+
+if [ ! -e "$protected_log" ] || [ ! -e "$protected_rotated_log" ]; then
+    printf 'Stale-temp cleanup must never remove the active or rotated log.\n' >&2
     exit 1
 fi
 
@@ -58,5 +67,26 @@ fi
 if find "$tmp_dir/system-tmp" -maxdepth 1 -type d -name 'update-all-mac-run.*' | grep -q .; then
     printf 'The current run scratch directory leaked after exit.\n' >&2
     find "$tmp_dir/system-tmp" -maxdepth 1 -print >&2
+    exit 1
+fi
+
+dry_run_file="$tmp_dir/system-tmp/update-all-mac.dry-run-survivor"
+: >"$dry_run_file"
+touch -t 202001010000 "$dry_run_file"
+
+TMPDIR="$tmp_dir/system-tmp" \
+    PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
+    HOME="$tmp_dir/home" \
+    UPDATE_ALL_TEMP_MAX_AGE_MINUTES=60 \
+    UPDATE_ALL_NO_PAUSE=1 \
+    /bin/bash "$repo_root/update-all-mac.command" \
+    --dry-run \
+    --no-color \
+    --log-file "$tmp_dir/dry-run.log" \
+    --lock-dir "$tmp_dir/dry-run-lock" \
+    --only npm >/dev/null 2>&1
+
+if [ ! -e "$dry_run_file" ]; then
+    printf 'Dry-run must not remove stale temp artifacts.\n' >&2
     exit 1
 fi

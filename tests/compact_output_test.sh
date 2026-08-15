@@ -26,7 +26,7 @@ case "${1:-}" in
         ;;
     update)
         printf '%s\n' "$MARKER"
-        sleep 2
+        sleep 3
         touch "$STATE_DIR/upgraded"
         exit 0
         ;;
@@ -73,6 +73,12 @@ fi
 
 if ! grep -Fq 'Still working' "$tmp_dir/compact-stdout.log"; then
     printf 'Compact output needs a heartbeat during long commands.\n' >&2
+    cat "$tmp_dir/compact-stdout.log" >&2
+    exit 1
+fi
+
+if ! grep -Fq 'if input is expected' "$tmp_dir/compact-stdout.log"; then
+    printf 'Compact output must explain how to uncover a hidden prompt.\n' >&2
     cat "$tmp_dir/compact-stdout.log" >&2
     exit 1
 fi

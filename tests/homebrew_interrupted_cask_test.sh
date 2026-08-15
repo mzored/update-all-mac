@@ -104,3 +104,8 @@ if ! grep -Fq 'Interrupted Homebrew cask upgrade found: broken-app' "$run_log"; 
     cat "$run_log" >&2
     exit 1
 fi
+
+if [ -d "$tmp_dir/caskroom/broken-app/1.0.upgrading" ]; then
+    printf 'Successful recovery must remove the stale .upgrading marker.\n' >&2
+    exit 1
+fi

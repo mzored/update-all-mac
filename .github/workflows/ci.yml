@@ -74,9 +74,11 @@ jobs:
       - name: Run recovery, authorization, and cleanup tests
         run: |
           tests/homebrew_interrupted_cask_test.sh
+          tests/cask_repair_force_gate_test.sh
           tests/sudo_askpass_test.sh
           tests/cleanup_test.sh
           tests/temp_cleanup_test.sh
+          tests/signal_cleanup_test.sh
 
       - name: Check Homebrew formula
         run: |

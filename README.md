@@ -234,6 +234,8 @@ old Homebrew versions, failed downloads, and unreferenced cache entries without 
 project-selected Rust, mise, or asdf versions. `--deep-clean` additionally purges
 Homebrew, npm, pip, pipx, and uv reinstall caches, so future installs may need to download
 those files again. `--dry-run --deep-clean` previews this work without deleting anything.
+Cleanup is its own selectable step: `--only homebrew` updates packages but does not clean
+caches; use `--only homebrew,cleanup` when both operations are wanted.
 
 If Homebrew finds a cask directory ending in `.upgrading`, the script reports the
 interrupted upgrade and tries a normal `brew reinstall --cask` before processing other
