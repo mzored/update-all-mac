@@ -239,7 +239,8 @@ caches; use `--only homebrew,cleanup` when both operations are wanted.
 
 If Homebrew finds a cask directory ending in `.upgrading`, the script reports the
 interrupted upgrade and tries a normal `brew reinstall --cask` before processing other
-updates. Forced uninstall remains disabled unless `--force-cask-repair` is explicitly used.
+updates. After a successful reinstall it removes that exact stale `.upgrading` directory.
+Forced uninstall remains disabled unless `--force-cask-repair` is explicitly used.
 
 Homebrew formulae and casks pinned with `brew pin` are intentionally skipped. They are
 reported in the run log but do not make the Homebrew step fail; all unpinned outdated

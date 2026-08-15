@@ -54,7 +54,7 @@ case "$*" in
     "info --cask regular-app")
         exit 0
         ;;
-    "reinstall --cask broken-app")
+    "reinstall --cask broken-app" | "reinstall --cask stubborn-app")
         exit 0
         ;;
     "upgrade --cask regular-app")
@@ -69,7 +69,16 @@ printf 'unexpected brew call: %s\n' "$*" >&2
 exit 64
 BREW_STUB
 
-chmod +x "$tmp_dir/bin/brew"
+cat >"$tmp_dir/bin/rm" <<'RM_STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${*: -1}" in
+    */stubborn-app/*.upgrading) exit 1 ;;
+esac
+exec /bin/rm "$@"
+RM_STUB
+
+chmod +x "$tmp_dir/bin/brew" "$tmp_dir/bin/rm"
 
 CALLS_FILE="$calls_file" \
     CASKROOM="$tmp_dir/caskroom" \
@@ -107,5 +116,27 @@ fi
 
 if [ -d "$tmp_dir/caskroom/broken-app/1.0.upgrading" ]; then
     printf 'Successful recovery must remove the stale .upgrading marker.\n' >&2
+    exit 1
+fi
+
+mkdir -p "$tmp_dir/caskroom/stubborn-app/2.0.upgrading/Stubborn.app"
+if ! CALLS_FILE="$calls_file" \
+    CASKROOM="$tmp_dir/caskroom" \
+    OUTDATED_COUNT_FILE="$outdated_count_file" \
+    PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
+    HOME="$tmp_dir/home" \
+    UPDATE_ALL_NO_PAUSE=1 \
+    /bin/bash "$repo_root/update-all-mac.command" \
+    --no-color \
+    --log-file "$tmp_dir/stubborn.log" \
+    --lock-dir "$tmp_dir/stubborn-lock" \
+    --only homebrew >/dev/null 2>&1; then
+    printf 'A successful reinstall must not fail only because marker cleanup was denied.\n' >&2
+    exit 1
+fi
+
+if ! grep -Fq 'stale .upgrading directory could not be removed: stubborn-app' "$tmp_dir/stubborn.log"; then
+    printf 'Expected a precise warning when the stale marker cannot be removed.\n' >&2
+    cat "$tmp_dir/stubborn.log" >&2
     exit 1
 fi

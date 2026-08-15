@@ -19,7 +19,10 @@ set -euo pipefail
 printf '%s %s\n' "$(basename "$0")" "$*" >>"$CALLS_FILE"
 case "$*" in
     "cleanup --help") printf '%s\n' '--scrub --prune=all' ;;
-    "cleanup --scrub" | "cleanup --prune=all") printf '%s\n' '==> This operation has freed approximately 1.9GB of disk space.' ;;
+    "cleanup --scrub" | "cleanup --prune=all")
+        printf '%s\n' '==> This operation has freed approximately 1.9GB of disk space.'
+        [ "${BREW_CLEANUP_FAIL:-0}" -ne 1 ]
+        ;;
     "cache --help") printf '%s\n' 'verify clean prune purge' ;;
     "cache prune --help" | "cache clean --help" | "cache purge --help" | "-m pip cache purge --help") exit 0 ;;
 esac
@@ -38,9 +41,12 @@ run_cleanup() {
     local calls_file="$tmp_dir/$name-calls.log"
     local run_log="$tmp_dir/$name-run.log"
     local stdout_file="$tmp_dir/$name-stdout.log"
+    local cleanup_fail=0
+    [ "$name" = "failed" ] && cleanup_fail=1
     : >"$calls_file"
 
     CALLS_FILE="$calls_file" \
+        BREW_CLEANUP_FAIL="$cleanup_fail" \
         PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
         HOME="$tmp_dir/home" \
         UPDATE_ALL_NO_PAUSE=1 \
@@ -67,6 +73,14 @@ done
 if ! grep -Fq 'Freed approximately 1.9GB' "$tmp_dir/safe-stdout.log"; then
     printf 'Cleanup summary did not report reclaimed disk space.\n' >&2
     cat "$tmp_dir/safe-stdout.log" >&2
+    exit 1
+fi
+
+run_cleanup failed
+
+if grep -Fq 'Freed approximately' "$tmp_dir/failed-stdout.log"; then
+    printf 'A failed cleanup must not print a green reclaimed-space summary.\n' >&2
+    cat "$tmp_dir/failed-stdout.log" >&2
     exit 1
 fi
 

@@ -32,6 +32,8 @@ LOCK_DIR="${UPDATE_ALL_LOCK_DIR:-/tmp/update-all-mac.lock}"
 LOCK_HELD=0
 RUN_TEMP_DIR=""
 LAST_COMMAND_RECLAIMED=""
+ACTIVE_HEARTBEAT_PID=""
+PARALLEL_WORKER_PIDS=()
 
 STEP_IDS=("homebrew" "npm" "mas" "ohmyzsh" "pip" "pipx" "uv" "rust" "mise" "asdf" "gcloud" "cleanup")
 STEP_NAMES=("Homebrew" "npm" "Mac App Store" "Oh My Zsh" "pip" "pipx" "uv" "Rust" "mise" "asdf" "gcloud" "Cleanup")
@@ -461,6 +463,7 @@ run_logged() {
         # Could not create a temp file; preserve live terminal and log output.
         start_heartbeat &
         heartbeat_pid=$!
+        ACTIVE_HEARTBEAT_PID="$heartbeat_pid"
         if [ "$VERBOSE" -eq 1 ]; then
             "$@" 2>&1 | filter_benign_noise | strip_ansi_stream | tee /dev/fd/9
         else
@@ -476,6 +479,7 @@ run_logged() {
     # after command exit, losing the useful tail when a run was interrupted.
     start_heartbeat &
     heartbeat_pid=$!
+    ACTIVE_HEARTBEAT_PID="$heartbeat_pid"
     if [ "$VERBOSE" -eq 1 ]; then
         "$@" 2>&1 | filter_benign_noise | tee "$tmp" | strip_ansi_stream | tee /dev/fd/9
     else
@@ -511,6 +515,9 @@ stop_heartbeat() {
     [ -n "$pid" ] || return 0
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
+    if [ "$ACTIVE_HEARTBEAT_PID" = "$pid" ]; then
+        ACTIVE_HEARTBEAT_PID=""
+    fi
 }
 
 # Run "$@" under a timeout when gtimeout/timeout is available; otherwise run it
@@ -568,7 +575,16 @@ init_step_tracking() {
 
 cleanup_runtime() {
     local temp_root="${TMPDIR:-/tmp}"
+    local pid=""
     temp_root=${temp_root%/}
+
+    stop_heartbeat "$ACTIVE_HEARTBEAT_PID"
+    if [ ${#PARALLEL_WORKER_PIDS[@]} -gt 0 ]; then
+        for pid in "${PARALLEL_WORKER_PIDS[@]}"; do
+            kill "$pid" 2>/dev/null || true
+        done
+    fi
+    PARALLEL_WORKER_PIDS=()
 
     if [ -n "$RUN_TEMP_DIR" ] && [ -d "$RUN_TEMP_DIR" ]; then
         case "$RUN_TEMP_DIR" in
@@ -629,7 +645,9 @@ cleanup_stale_temp_artifacts() {
     current_uid=$(id -u)
 
     while IFS= read -r -d '' path; do
-        [ "$path" != "$LOG_FILE" ] && [ "$path" != "$LOG_FILE.1" ] || continue
+        case "$path" in
+            "$LOG_FILE" | "$LOG_FILE.1") continue ;;
+        esac
         case "${path##*/}" in
             update-all-mac.*) rm -f "$path" ;;
         esac
@@ -877,6 +895,7 @@ run_steps_parallel() {
             run_step_worker "$idx" "$seg" "$logseg" "$rcfile" &
             bg_idx+=("$idx")
             bg_pid+=("$!")
+            PARALLEL_WORKER_PIDS+=("$!")
         fi
     done
 
@@ -900,10 +919,12 @@ run_steps_parallel() {
     if [ "${#bg_pid[@]}" -gt 0 ]; then
         start_heartbeat &
         wait_heartbeat_pid=$!
+        ACTIVE_HEARTBEAT_PID="$wait_heartbeat_pid"
         for i in "${!bg_pid[@]}"; do
             wait "${bg_pid[$i]}" 2>/dev/null || true
         done
         stop_heartbeat "$wait_heartbeat_pid"
+        PARALLEL_WORKER_PIDS=()
     fi
 
     # Replay background steps in canonical order.
@@ -980,8 +1001,10 @@ repair_cask() {
 
     log "  → Repairing cask: $cask"
     if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew reinstall --cask "$cask"; then
-        remove_interrupted_cask_markers "$cask"
-        return $?
+        if ! remove_interrupted_cask_markers "$cask"; then
+            log "${YELLOW}  ⚠️  Cask was reinstalled, but its stale .upgrading directory could not be removed: $cask${NC}"
+        fi
+        return 0
     fi
 
     if [ "$BREW_FORCE_CASK_REPAIR" -ne 1 ]; then
@@ -994,8 +1017,10 @@ repair_cask() {
     run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew uninstall --cask --force "$cask" || true
 
     if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew install --cask "$cask"; then
-        remove_interrupted_cask_markers "$cask"
-        return $?
+        if ! remove_interrupted_cask_markers "$cask"; then
+            log "${YELLOW}  ⚠️  Cask was reinstalled, but its stale .upgrading directory could not be removed: $cask${NC}"
+        fi
+        return 0
     fi
 
     return 1
@@ -1703,6 +1728,9 @@ update_gcloud() {
 # === Safe cache cleanup ===
 run_cleanup() {
     local had_warn=0
+    local brew_cleanup_ok=0
+    local brew_cleanup_help=""
+    local npm_cache_help=""
 
     if [ "$DRY_RUN" -eq 1 ]; then
         if [ "$DEEP_CLEAN" -eq 1 ]; then
@@ -1714,22 +1742,26 @@ run_cleanup() {
     fi
 
     if command -v brew >/dev/null 2>&1; then
-        if [ "$DEEP_CLEAN" -eq 1 ] && brew cleanup --help 2>/dev/null | grep -q -- '--prune'; then
+        brew_cleanup_help=$(brew cleanup --help 2>/dev/null || true)
+        if [ "$DEEP_CLEAN" -eq 1 ] && grep -q -- '--prune' <<<"$brew_cleanup_help"; then
             log "  → Purging Homebrew download caches..."
-            run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup --prune=all || had_warn=1
-        elif brew cleanup --help 2>/dev/null | grep -q -- '--scrub'; then
+            if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup --prune=all; then brew_cleanup_ok=1; else had_warn=1; fi
+        elif grep -q -- '--scrub' <<<"$brew_cleanup_help"; then
             log "  → Removing stale Homebrew downloads and old versions..."
-            run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup --scrub || had_warn=1
+            if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup --scrub; then brew_cleanup_ok=1; else had_warn=1; fi
         else
             log "  → Removing old Homebrew versions..."
-            run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup || had_warn=1
+            if run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup; then brew_cleanup_ok=1; else had_warn=1; fi
         fi
-        if [ -n "$LAST_COMMAND_RECLAIMED" ]; then
+        if [ "$brew_cleanup_ok" -eq 1 ] && [ -n "$LAST_COMMAND_RECLAIMED" ]; then
             log "  ${GREEN}→ Freed approximately $LAST_COMMAND_RECLAIMED${NC}"
         fi
     fi
 
-    if command -v npm >/dev/null 2>&1 && npm cache --help 2>/dev/null | grep -q -- 'verify'; then
+    if command -v npm >/dev/null 2>&1; then
+        npm_cache_help=$(npm cache --help 2>/dev/null || true)
+    fi
+    if [ -n "$npm_cache_help" ] && grep -q -- 'verify' <<<"$npm_cache_help"; then
         if [ "$DEEP_CLEAN" -eq 1 ]; then
             log "  → Purging the npm cache..."
             run_logged npm cache clean --force || had_warn=1
