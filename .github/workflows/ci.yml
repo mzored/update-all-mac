@@ -43,7 +43,10 @@ jobs:
         run: tests/npm_network_error_test.sh
 
       - name: Run log capture test
-        run: tests/run_logged_capture_test.sh
+        run: |
+          tests/run_logged_capture_test.sh
+          tests/streaming_log_test.sh
+          tests/compact_output_test.sh
 
       - name: Run npm post-upgrade check test
         run: tests/npm_postcheck_warn_test.sh
@@ -52,7 +55,9 @@ jobs:
         run: tests/log_rotation_test.sh
 
       - name: Run parallel steps test
-        run: tests/parallel_steps_test.sh
+        run: |
+          tests/parallel_steps_test.sh
+          tests/parallel_log_capture_test.sh
 
       - name: Run malloc noise filter test
         run: tests/malloc_noise_filter_test.sh
@@ -65,6 +70,13 @@ jobs:
 
       - name: Run extra manager test
         run: tests/extra_manager_test.sh
+
+      - name: Run recovery, authorization, and cleanup tests
+        run: |
+          tests/homebrew_interrupted_cask_test.sh
+          tests/sudo_askpass_test.sh
+          tests/cleanup_test.sh
+          tests/temp_cleanup_test.sh
 
       - name: Check Homebrew formula
         run: |

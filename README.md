@@ -2,6 +2,8 @@
 
 One-command macOS updater for Homebrew formulae and casks, Mac App Store apps, global npm packages, Oh My Zsh, pipx packages, uv tools, Rust/cargo, mise, asdf, gcloud components, and optional macOS update checks.
 
+Current version: **3.4.0**
+
 The recommended installation path is Homebrew. It avoids the common macOS Gatekeeper friction that happens when unsigned `.command` files are downloaded through a browser and opened from Finder.
 
 ## What It Updates
@@ -16,6 +18,7 @@ The recommended installation path is Homebrew. It avoids the common macOS Gateke
 - mise-managed tools (`mise upgrade`)
 - asdf plugins (`asdf plugin update --all`)
 - Google Cloud CLI components (`gcloud components update`)
+- Safe periodic cleanup for Homebrew, npm, and uv caches
 - Optional macOS update check through `softwareupdate -l`
 
 Every step self-detects its tool and is skipped when the tool is absent, so the same
@@ -135,6 +138,18 @@ Bootstrap a fresh Mac by installing Homebrew if it is missing:
 update-all-mac --install-homebrew
 ```
 
+Show the complete command output instead of compact progress:
+
+```bash
+update-all-mac --verbose
+```
+
+Purge reinstall/download caches in addition to safe cleanup:
+
+```bash
+update-all-mac --deep-clean
+```
+
 Run only selected steps:
 
 ```bash
@@ -175,6 +190,8 @@ UPDATE_ALL_NO_PAUSE=1 update-all-mac --no-color
 --parallel             Run npm, pipx, and Mac App Store steps concurrently
 --dry-run              Show what would be updated without changing anything
 --install-homebrew     Install Homebrew if it is missing (bootstrap a Mac)
+--verbose              Stream full command output to the terminal
+--deep-clean           Purge reinstall caches in the Cleanup step
 --log-file <path>      Override log file path
 --lock-dir <path>      Override lock directory path
 --list-steps           Print available step IDs and exit
@@ -202,6 +219,7 @@ rust       Rust (rustup + cargo)
 mise       mise
 asdf       asdf
 gcloud     gcloud
+cleanup    Cleanup
 macos      macOS (only when --macos is used)
 ```
 
@@ -209,6 +227,17 @@ macos      macOS (only when --macos is used)
 without refreshing the Homebrew catalog or changing anything. `--doctor` prints the
 tools detected on the current Mac and their versions, then exits. `--install-homebrew`
 installs Homebrew non-interactively when it is missing (opt-in bootstrap for a new Mac).
+
+The default `Cleanup` step uses conservative garbage collectors: `brew cleanup --scrub`,
+`npm cache verify`, and `uv cache prune` when those commands are available. It removes
+old Homebrew versions, failed downloads, and unreferenced cache entries without removing
+project-selected Rust, mise, or asdf versions. `--deep-clean` additionally purges
+Homebrew, npm, pip, pipx, and uv reinstall caches, so future installs may need to download
+those files again. `--dry-run --deep-clean` previews this work without deleting anything.
+
+If Homebrew finds a cask directory ending in `.upgrading`, the script reports the
+interrupted upgrade and tries a normal `brew reinstall --cask` before processing other
+updates. Forced uninstall remains disabled unless `--force-cask-repair` is explicitly used.
 
 Homebrew formulae and casks pinned with `brew pin` are intentionally skipped. They are
 reported in the run log but do not make the Homebrew step fail; all unpinned outdated
@@ -233,10 +262,14 @@ UPDATE_ALL_MAS_ACCURATE=1
 UPDATE_ALL_PARALLEL=1
 UPDATE_ALL_DRY_RUN=1
 UPDATE_ALL_INSTALL_HOMEBREW=1
+UPDATE_ALL_VERBOSE=1
+UPDATE_ALL_DEEP_CLEAN=1
 UPDATE_ALL_LOG_FILE=/path/to/update-all-mac.log
 UPDATE_ALL_LOG_MAX_BYTES=1048576
 UPDATE_ALL_NET_TIMEOUT=600
 UPDATE_ALL_LOCK_DIR=/tmp/update-all-mac.lock
+UPDATE_ALL_HEARTBEAT_SECONDS=30
+UPDATE_ALL_TEMP_MAX_AGE_MINUTES=1440
 UPDATE_ALL_NO_PAUSE=1
 ```
 
@@ -251,9 +284,15 @@ By default, logs are written to:
 ~/Library/Logs/update-all-mac.log
 ```
 
-Each step's full command output is captured in the log, so a failed upgrade can be
-diagnosed after the fact. When the log grows past `UPDATE_ALL_LOG_MAX_BYTES` (1 MiB by
-default), it is rotated once to `update-all-mac.log.1` before the next run starts.
+Each step's full command output is written to the log in real time, so an interrupted
+upgrade can be diagnosed from its final completed line. The terminal shows compact
+progress and a periodic heartbeat by default; use `--verbose` for the full stream. When
+the log grows past `UPDATE_ALL_LOG_MAX_BYTES` (1 MiB by default), it is rotated once to
+`update-all-mac.log.1` before the next run starts.
+
+Current-run temporary files live in one private directory and are removed through a
+single exit/signal cleanup path. On the next non-dry run, updater-owned temporary files
+older than `UPDATE_ALL_TEMP_MAX_AGE_MINUTES` are removed by exact filename patterns.
 
 A lock directory prevents concurrent runs:
 
@@ -267,6 +306,7 @@ If a previous run crashed, the script detects stale locks and removes them when 
 
 - Review scripts before running them from the internet.
 - Some updates can close, replace, or relaunch apps. The script warns when Homebrew cask apps appear to be running.
+- Interactive macOS runs configure a temporary `SUDO_ASKPASS` helper. If Homebrew needs administrator access, a native password dialog appears and the password is passed directly to `sudo`; it is never stored by the updater. Existing `SUDO_ASKPASS` configuration is preserved.
 - `--force-cask-repair` can uninstall and reinstall a cask as a recovery fallback. Use it only when you understand the risk.
 - The macOS step checks for system updates but does not install them.
 - A signed and notarized `.app` or `.pkg` would be required for the cleanest double-click Finder experience. This repository currently distributes a CLI script.

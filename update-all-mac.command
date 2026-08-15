@@ -3,8 +3,8 @@
 # Full macOS app and package updater
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
-# Date: 2026-07-22
-# Version: 3.3.1
+# Date: 2026-08-15
+# Version: 3.4.0
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -24,13 +24,18 @@ STEP_FAIL=30
 LOG_FILE="${UPDATE_ALL_LOG_FILE:-$HOME/Library/Logs/update-all-mac.log}"
 LOG_MAX_BYTES="${UPDATE_ALL_LOG_MAX_BYTES:-1048576}"
 NET_TIMEOUT="${UPDATE_ALL_NET_TIMEOUT:-600}"
+HEARTBEAT_SECONDS="${UPDATE_ALL_HEARTBEAT_SECONDS:-30}"
+TEMP_MAX_AGE_MINUTES="${UPDATE_ALL_TEMP_MAX_AGE_MINUTES:-1440}"
 DATE=$(date '+%Y-%m-%d %H:%M:%S')
 START_EPOCH=$(date +%s)
 LOCK_DIR="${UPDATE_ALL_LOCK_DIR:-/tmp/update-all-mac.lock}"
+LOCK_HELD=0
+RUN_TEMP_DIR=""
+LAST_COMMAND_RECLAIMED=""
 
-STEP_IDS=("homebrew" "npm" "mas" "ohmyzsh" "pip" "pipx" "uv" "rust" "mise" "asdf" "gcloud")
-STEP_NAMES=("Homebrew" "npm" "Mac App Store" "Oh My Zsh" "pip" "pipx" "uv" "Rust" "mise" "asdf" "gcloud")
-STEP_FUNCS=("update_homebrew" "update_npm" "update_mas" "update_ohmyzsh" "check_pip" "update_pipx" "update_uv" "update_rust" "update_mise" "update_asdf" "update_gcloud")
+STEP_IDS=("homebrew" "npm" "mas" "ohmyzsh" "pip" "pipx" "uv" "rust" "mise" "asdf" "gcloud" "cleanup")
+STEP_NAMES=("Homebrew" "npm" "Mac App Store" "Oh My Zsh" "pip" "pipx" "uv" "Rust" "mise" "asdf" "gcloud" "Cleanup")
+STEP_FUNCS=("update_homebrew" "update_npm" "update_mas" "update_ohmyzsh" "check_pip" "update_pipx" "update_uv" "update_rust" "update_mise" "update_asdf" "update_gcloud" "run_cleanup")
 STEP_STATUS=()
 STEP_SELECTED=()
 TOTAL_STEPS=${#STEP_NAMES[@]}
@@ -52,6 +57,8 @@ PARALLEL=0
 DRY_RUN=0
 DOCTOR=0
 INSTALL_HOMEBREW=0
+VERBOSE=0
+DEEP_CLEAN=0
 
 truthy() {
     case "${1:-0}" in
@@ -72,6 +79,8 @@ if truthy "${UPDATE_ALL_MAS_ACCURATE:-0}"; then MAS_ACCURATE=1; fi
 if truthy "${UPDATE_ALL_PARALLEL:-0}"; then PARALLEL=1; fi
 if truthy "${UPDATE_ALL_DRY_RUN:-0}"; then DRY_RUN=1; fi
 if truthy "${UPDATE_ALL_INSTALL_HOMEBREW:-0}"; then INSTALL_HOMEBREW=1; fi
+if truthy "${UPDATE_ALL_VERBOSE:-0}"; then VERBOSE=1; fi
+if truthy "${UPDATE_ALL_DEEP_CLEAN:-0}"; then DEEP_CLEAN=1; fi
 
 prepend_path_if_dir() {
     local dir="$1"
@@ -123,6 +132,8 @@ Options:
   --parallel             Run npm, pipx, and Mac App Store steps concurrently
   --dry-run              Show what would be updated without changing anything
   --install-homebrew     Install Homebrew if it is missing (bootstrap a Mac)
+  --verbose              Stream full command output to the terminal
+  --deep-clean           Purge reinstall caches in the Cleanup step
   --log-file <path>      Override log file path
   --lock-dir <path>      Override lock directory path
   --list-steps           Print available step IDs and exit
@@ -286,6 +297,14 @@ parse_args() {
                 INSTALL_HOMEBREW=1
                 shift
                 ;;
+            --verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --deep-clean)
+                DEEP_CLEAN=1
+                shift
+                ;;
             --list-steps)
                 LIST_STEPS=1
                 shift
@@ -385,6 +404,16 @@ strip_ansi() {
     sed -E $'s/\x1B\\[[0-9;]*[mK]//g'
 }
 
+# Line-buffered ANSI stripping for live command logs. GNU and BSD sed use
+# different flags for unbuffered/line-buffered output, so detect the variant.
+strip_ansi_stream() {
+    if sed --version >/dev/null 2>&1; then
+        sed -u -E $'s/\x1B\\[[0-9;]*[mK]//g'
+    else
+        sed -l -E $'s/\x1B\\[[0-9;]*[mK]//g'
+    fi
+}
+
 # Drop known-benign macOS libmalloc diagnostics that some subprocesses (notably
 # Homebrew's bundled ruby during cask upgrades) print to stderr. They are
 # cosmetic and unrelated to a command's success, but pollute both the terminal
@@ -406,24 +435,79 @@ log() {
     printf '%s\n' "$message" | strip_ansi >&9
 }
 
+# Detailed package tables stay in the canonical log by default. --verbose
+# mirrors them to the terminal for users who want the complete command stream.
+log_detail() {
+    local message="$1"
+
+    if [ "$VERBOSE" -eq 1 ]; then
+        printf '%s\n' "$message"
+    fi
+    printf '%s\n' "$message" | strip_ansi >&9
+}
+
 # Run an external command, mirroring its combined output live to the terminal
 # and a color-stripped copy to the log file. Returns the command's own exit code
 # (not tee's), so callers can branch on success/failure as usual.
 run_logged() {
     local tmp="" rc=0
+    local heartbeat_pid=""
 
-    tmp=$(mktemp "${TMPDIR:-/tmp}/update-all-mac.XXXXXX" 2>/dev/null) || tmp=""
+    LAST_COMMAND_RECLAIMED=""
+    if ensure_run_temp_dir; then
+        tmp=$(mktemp "$RUN_TEMP_DIR/command.XXXXXX" 2>/dev/null) || tmp=""
+    fi
     if [ -z "$tmp" ]; then
-        # Could not create a temp file; run without log capture rather than fail.
-        "$@" 2>&1 | filter_benign_noise
-        return "${PIPESTATUS[0]}"
+        # Could not create a temp file; preserve live terminal and log output.
+        start_heartbeat &
+        heartbeat_pid=$!
+        if [ "$VERBOSE" -eq 1 ]; then
+            "$@" 2>&1 | filter_benign_noise | strip_ansi_stream | tee /dev/fd/9
+        else
+            "$@" 2>&1 | filter_benign_noise | strip_ansi_stream >&9
+        fi
+        rc=${PIPESTATUS[0]}
+        stop_heartbeat "$heartbeat_pid"
+        return "$rc"
     fi
 
-    "$@" 2>&1 | filter_benign_noise | tee "$tmp"
+    # Keep a diagnostic tail while streaming every completed line into the
+    # canonical log. The previous implementation flushed the temp file only
+    # after command exit, losing the useful tail when a run was interrupted.
+    start_heartbeat &
+    heartbeat_pid=$!
+    if [ "$VERBOSE" -eq 1 ]; then
+        "$@" 2>&1 | filter_benign_noise | tee "$tmp" | strip_ansi_stream | tee /dev/fd/9
+    else
+        "$@" 2>&1 | filter_benign_noise | tee "$tmp" | strip_ansi_stream >&9
+    fi
     rc=${PIPESTATUS[0]}
-    strip_ansi <"$tmp" >&9
+    stop_heartbeat "$heartbeat_pid"
+    if [ "$rc" -ne 0 ] && [ "$VERBOSE" -ne 1 ] && [ -s "$tmp" ]; then
+        printf '%s\n' "  ↳ Last command output (full details: $LOG_FILE):"
+        tail -n 20 "$tmp"
+    fi
+    LAST_COMMAND_RECLAIMED=$(sed -nE 's/.*free approximately ([^ ]+) of disk space.*/\1/p' "$tmp" 2>/dev/null | tail -n 1)
     rm -f "$tmp"
     return "$rc"
+}
+
+start_heartbeat() {
+    local elapsed=0
+
+    [[ "$HEARTBEAT_SECONDS" =~ ^[1-9][0-9]*$ ]] || return 0
+    while sleep "$HEARTBEAT_SECONDS"; do
+        elapsed=$((elapsed + HEARTBEAT_SECONDS))
+        printf '  … Still working (%ss; details: %s)\n' "$elapsed" "$LOG_FILE"
+    done
+}
+
+stop_heartbeat() {
+    local pid="${1:-}"
+
+    [ -n "$pid" ] || return 0
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 }
 
 # Run "$@" under a timeout when gtimeout/timeout is available; otherwise run it
@@ -479,13 +563,115 @@ init_step_tracking() {
     done
 }
 
+cleanup_runtime() {
+    local temp_root="${TMPDIR:-/tmp}"
+    temp_root=${temp_root%/}
+
+    if [ -n "$RUN_TEMP_DIR" ] && [ -d "$RUN_TEMP_DIR" ]; then
+        case "$RUN_TEMP_DIR" in
+            "$temp_root"/update-all-mac-run.*) rm -rf "$RUN_TEMP_DIR" ;;
+        esac
+    fi
+
+    if [ "$LOCK_HELD" -eq 1 ]; then
+        rm -rf "$LOCK_DIR"
+        LOCK_HELD=0
+    fi
+}
+
+handle_exit() {
+    local rc=$?
+    trap - EXIT INT TERM
+    cleanup_runtime
+    exit "$rc"
+}
+
+handle_interrupt() {
+    local signal="$1"
+    local rc=130
+
+    [ "$signal" = "TERM" ] && rc=143
+    trap - EXIT INT TERM
+    cleanup_runtime
+    exit "$rc"
+}
+
+install_runtime_traps() {
+    trap 'handle_exit' EXIT
+    trap 'handle_interrupt INT' INT
+    trap 'handle_interrupt TERM' TERM
+}
+
+ensure_run_temp_dir() {
+    local temp_root="${TMPDIR:-/tmp}"
+    temp_root=${temp_root%/}
+
+    if [ -n "$RUN_TEMP_DIR" ] && [ -d "$RUN_TEMP_DIR" ]; then
+        return 0
+    fi
+
+    RUN_TEMP_DIR=$(mktemp -d "$temp_root/update-all-mac-run.XXXXXX" 2>/dev/null) || RUN_TEMP_DIR=""
+    [ -n "$RUN_TEMP_DIR" ]
+}
+
+cleanup_stale_temp_artifacts() {
+    local temp_root="${TMPDIR:-/tmp}"
+    local path=""
+
+    [ "$DRY_RUN" -ne 1 ] || return 0
+    [[ "$TEMP_MAX_AGE_MINUTES" =~ ^[1-9][0-9]*$ ]] || return 0
+    temp_root=${temp_root%/}
+    [ -d "$temp_root" ] || return 0
+
+    while IFS= read -r -d '' path; do
+        case "${path##*/}" in
+            update-all-mac.*) rm -f "$path" ;;
+        esac
+    done < <(find "$temp_root" -maxdepth 1 -type f -name 'update-all-mac.*' -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
+
+    while IFS= read -r -d '' path; do
+        case "${path##*/}" in
+            update-all-mac-parallel.* | update-all-mac-run.*) rm -rf "$path" ;;
+        esac
+    done < <(find "$temp_root" -maxdepth 1 -type d \( -name 'update-all-mac-parallel.*' -o -name 'update-all-mac-run.*' \) -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
+}
+
+setup_gui_password_prompt() {
+    local helper=""
+
+    [ "$DRY_RUN" -ne 1 ] || return 0
+    step_selected_by_id "homebrew" || return 0
+    [ -t 0 ] && [ -t 1 ] || return 0
+    [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+    [ -x /usr/bin/osascript ] || return 0
+
+    if [ -n "${SUDO_ASKPASS:-}" ]; then
+        log "${BLUE}🔐 Administrator requests will use your configured password helper.${NC}"
+        return 0
+    fi
+
+    if ! ensure_run_temp_dir; then
+        log "${YELLOW}⚠️  Could not prepare the native password dialog; sudo may prompt in Terminal.${NC}"
+        return 0
+    fi
+
+    helper="$RUN_TEMP_DIR/askpass"
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'exec /usr/bin/osascript -e '\''text returned of (display dialog "update-all-mac needs administrator access" default answer "" with hidden answer buttons {"Cancel", "Continue"} default button "Continue" with icon caution)'\'' ' \
+        >"$helper"
+    chmod 700 "$helper"
+    export SUDO_ASKPASS="$helper"
+    log "${BLUE}🔐 If Homebrew needs administrator access, macOS will show a password dialog.${NC}"
+}
+
 acquire_lock() {
     local pid_file="$LOCK_DIR/pid"
     local pid=""
 
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         printf '%s\n' "$$" >"$pid_file" 2>/dev/null || true
-        trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+        LOCK_HELD=1
         return 0
     fi
 
@@ -500,7 +686,7 @@ acquire_lock() {
 
         if mkdir "$LOCK_DIR" 2>/dev/null; then
             printf '%s\n' "$$" >"$pid_file" 2>/dev/null || true
-            trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+            LOCK_HELD=1
             return 0
         fi
     fi
@@ -592,6 +778,9 @@ run_step_worker() {
         # the shared log is written once, in order, at replay time.
         exec >"$seg" 2>&1
         exec 9>/dev/null
+        # The segment is the parallel worker's replay transport. Force command
+        # details into it even when the parent uses compact terminal output.
+        VERBOSE=1
         "$step_func"
         printf '%s' "$?" >"$rcfile"
     )
@@ -648,7 +837,9 @@ run_steps_parallel() {
     local -a bg_idx=()
     local -a bg_pid=()
 
-    tmp_root=$(mktemp -d "${TMPDIR:-/tmp}/update-all-mac-parallel.XXXXXX" 2>/dev/null) || tmp_root=""
+    if ensure_run_temp_dir; then
+        tmp_root=$(mktemp -d "$RUN_TEMP_DIR/parallel.XXXXXX" 2>/dev/null) || tmp_root=""
+    fi
     if [ -z "$tmp_root" ]; then
         log "${YELLOW}⚠️  Could not create a temp dir for parallel mode; running steps sequentially.${NC}"
         run_steps_sequential "$total_steps"
@@ -727,6 +918,24 @@ cask_app_missing() {
 
     app_path=$(get_primary_cask_app_path "$cask")
     [ -n "$app_path" ] && [ ! -e "$app_path" ]
+}
+
+# Print cask tokens whose on-disk version directory shows that Homebrew was
+# interrupted during an upgrade. Homebrew does not report these through
+# `brew outdated`, so they must be recovered before normal cask processing.
+find_interrupted_casks() {
+    local caskroom=""
+    local version_dir=""
+    local cask_dir=""
+
+    caskroom=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew --caskroom 2>/dev/null || true)
+    [ -d "$caskroom" ] || return 0
+
+    while IFS= read -r version_dir; do
+        [ -n "$version_dir" ] || continue
+        cask_dir=${version_dir%/*}
+        printf '%s\n' "${cask_dir##*/}"
+    done < <(find "$caskroom" -mindepth 2 -maxdepth 2 -type d -name '*.upgrading' -print 2>/dev/null)
 }
 
 repair_cask() {
@@ -876,6 +1085,7 @@ update_homebrew() {
     local casks_to_upgrade=()
     local pre_repair_casks=()
     local failed_casks=()
+    local interrupted_casks=()
 
     log "  → Updating Homebrew metadata..."
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -883,6 +1093,22 @@ update_homebrew() {
     elif ! brew_update_catalog; then
         log "${RED}  ⚠️  Could not update Homebrew indexes${NC}"
         had_error=1
+    fi
+
+    while IFS= read -r cask; do
+        [ -n "$cask" ] && interrupted_casks+=("$cask")
+    done < <(find_interrupted_casks)
+
+    if [ ${#interrupted_casks[@]} -gt 0 ]; then
+        for cask in "${interrupted_casks[@]}"; do
+            log "${YELLOW}  ⚠️  Interrupted Homebrew cask upgrade found: $cask${NC}"
+            if [ "$DRY_RUN" -eq 1 ]; then
+                log "  ${BLUE}[dry-run] would repair cask: $cask${NC}"
+            elif ! repair_cask "$cask"; then
+                log "${RED}  ⚠️  Could not recover interrupted cask: $cask${NC}"
+                had_error=1
+            fi
+        done
     fi
 
     log "  → Checking for outdated packages..."
@@ -922,7 +1148,7 @@ update_homebrew() {
         if [ ${#upgradeable_formulae[@]} -gt 0 ]; then
             log "  ${YELLOW}[dry-run] would upgrade ${#upgradeable_formulae[@]} formula(e):${NC}"
             for line in "${upgradeable_formulae[@]}"; do
-                log "$line"
+                log_detail "$line"
             done
         else
             log "  ${GREEN}→ No unpinned outdated formulae to upgrade${NC}"
@@ -930,7 +1156,7 @@ update_homebrew() {
         if [ ${#upgradeable_casks[@]} -gt 0 ]; then
             log "  ${YELLOW}[dry-run] would upgrade ${#upgradeable_casks[@]} cask(s):${NC}"
             for cask in "${upgradeable_casks[@]}"; do
-                log "$cask"
+                log_detail "$cask"
             done
         else
             log "  ${GREEN}→ No unpinned outdated apps to upgrade${NC}"
@@ -938,25 +1164,12 @@ update_homebrew() {
         return "$STEP_OK"
     fi
 
-    if [ ${#upgradeable_formulae[@]} -gt 0 ]; then
-        log "  ${YELLOW}→ Unpinned outdated formulae found: ${#upgradeable_formulae[@]}${NC}"
-        for line in "${upgradeable_formulae[@]}"; do
-            log "$line"
-        done
-        if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula "${upgradeable_formulae[@]}"; then
-            log "${RED}  ⚠️  Error while upgrading formulae${NC}"
-            had_error=1
-        fi
-    else
-        log "  ${GREEN}→ No unpinned outdated formulae to upgrade${NC}"
-    fi
-
     # Bash 3.2 (default on macOS) + `set -u`: empty "${arr[@]}" triggers "unbound variable".
     if [ ${#upgradeable_casks[@]} -gt 0 ]; then
         check_running_apps "${upgradeable_casks[@]}"
         log "  ${YELLOW}→ Unpinned outdated apps found: ${#upgradeable_casks[@]}${NC}"
         for cask in "${upgradeable_casks[@]}"; do
-            log "$cask"
+            log_detail "$cask"
         done
 
         for cask in "${upgradeable_casks[@]}"; do
@@ -1010,10 +1223,17 @@ update_homebrew() {
         log "  ${GREEN}→ No unpinned outdated apps to upgrade${NC}"
     fi
 
-    log "  → Cleaning cache..."
-    if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup; then
-        log "${YELLOW}  ⚠️  Homebrew cleanup completed with warnings${NC}"
-        had_warn=1
+    if [ ${#upgradeable_formulae[@]} -gt 0 ]; then
+        log "  ${YELLOW}→ Unpinned outdated formulae found: ${#upgradeable_formulae[@]}${NC}"
+        for line in "${upgradeable_formulae[@]}"; do
+            log_detail "$line"
+        done
+        if ! run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew upgrade --formula "${upgradeable_formulae[@]}"; then
+            log "${RED}  ⚠️  Error while upgrading formulae${NC}"
+            had_error=1
+        fi
+    else
+        log "  ${GREEN}→ No unpinned outdated formulae to upgrade${NC}"
     fi
 
     if [ "$had_error" -ne 0 ]; then
@@ -1066,7 +1286,7 @@ update_npm() {
         return "$STEP_OK"
     fi
 
-    log "$outdated_output"
+    log_detail "$outdated_output"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  ${BLUE}[dry-run] would run: npm update -g${NC}"
@@ -1130,7 +1350,7 @@ update_mas() {
         return "$STEP_OK"
     fi
 
-    log "$outdated_output"
+    log_detail "$outdated_output"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  ${BLUE}[dry-run] would run: mas upgrade${NC}"
@@ -1441,6 +1661,75 @@ update_gcloud() {
     return "$STEP_FAIL"
 }
 
+# === Safe cache cleanup ===
+run_cleanup() {
+    local had_warn=0
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        if [ "$DEEP_CLEAN" -eq 1 ]; then
+            log "  ${BLUE}[dry-run] would run deep cache cleanup${NC}"
+        else
+            log "  ${BLUE}[dry-run] would run safe cache cleanup${NC}"
+        fi
+        return "$STEP_OK"
+    fi
+
+    if command -v brew >/dev/null 2>&1; then
+        if [ "$DEEP_CLEAN" -eq 1 ] && brew cleanup --help 2>/dev/null | grep -q -- '--prune'; then
+            log "  → Purging Homebrew download caches..."
+            run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup --prune=all || had_warn=1
+        elif brew cleanup --help 2>/dev/null | grep -q -- '--scrub'; then
+            log "  → Removing stale Homebrew downloads and old versions..."
+            run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup --scrub || had_warn=1
+        else
+            log "  → Removing old Homebrew versions..."
+            run_logged env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew cleanup || had_warn=1
+        fi
+        if [ -n "$LAST_COMMAND_RECLAIMED" ]; then
+            log "  ${GREEN}→ Freed approximately $LAST_COMMAND_RECLAIMED${NC}"
+        fi
+    fi
+
+    if command -v npm >/dev/null 2>&1 && npm cache --help 2>/dev/null | grep -q -- 'verify'; then
+        if [ "$DEEP_CLEAN" -eq 1 ]; then
+            log "  → Purging the npm cache..."
+            run_logged npm cache clean --force || had_warn=1
+        else
+            log "  → Verifying and compacting the npm cache..."
+            run_logged npm cache verify || had_warn=1
+        fi
+    fi
+
+    if command -v uv >/dev/null 2>&1; then
+        if [ "$DEEP_CLEAN" -eq 1 ] && uv cache clean --help >/dev/null 2>&1; then
+            log "  → Purging the uv cache..."
+            run_logged uv cache clean || had_warn=1
+        elif uv cache prune --help >/dev/null 2>&1; then
+            log "  → Pruning unused uv cache entries..."
+            run_logged uv cache prune || had_warn=1
+        fi
+    fi
+
+    if [ "$DEEP_CLEAN" -eq 1 ]; then
+        if command -v python3 >/dev/null 2>&1 && python3 -m pip cache purge --help >/dev/null 2>&1; then
+            log "  → Purging the pip cache..."
+            run_logged python3 -m pip cache purge || had_warn=1
+        fi
+
+        if command -v pipx >/dev/null 2>&1 && pipx cache purge --help >/dev/null 2>&1; then
+            log "  → Purging cached pipx run environments..."
+            run_logged pipx cache purge || had_warn=1
+        fi
+    fi
+
+    if [ "$had_warn" -ne 0 ]; then
+        log "${YELLOW}  ⚠️  Some optional cleanup operations did not complete${NC}"
+        return "$STEP_WARN"
+    fi
+
+    return "$STEP_OK"
+}
+
 # === macOS update check ===
 check_macos_updates() {
     if ! command -v softwareupdate >/dev/null 2>&1; then
@@ -1546,10 +1835,13 @@ init_step_selection
 validate_lock_dir
 init_logging
 init_step_tracking
+install_runtime_traps
 
 if ! acquire_lock; then
     exit 1
 fi
+
+cleanup_stale_temp_artifacts
 
 log "${BLUE}╔════════════════════════════════════════════════╗${NC}"
 log "${BLUE}║   🔄 UPDATE ALL APPS AND PACKAGES    ║${NC}"
@@ -1562,6 +1854,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
     log "${YELLOW}🧪 DRY RUN — no changes will be made${NC}"
     log ""
 fi
+
+setup_gui_password_prompt
+log ""
 
 run_total=${#RUN_STEP_INDEXES[@]}
 ANY_STEP_FAILED=0
