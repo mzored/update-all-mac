@@ -7,7 +7,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT
+trap 'rc=$?; if [ "${KEEP_TEST_TMP:-0}" = "1" ]; then printf "kept: %s (rc=%s)\n" "$tmp_dir" "$rc" >&2; else rm -rf "$tmp_dir"; fi' EXIT
 
 mkdir -p "$tmp_dir/bin" "$tmp_dir/home" "$tmp_dir/caskroom"
 
@@ -41,6 +41,7 @@ case "$*" in
         ;;
     "upgrade --cask regular-app")
         printf '%s\n' "${SUDO_ASKPASS:-}" >"$ASKPASS_CAPTURE"
+        printf '%s\n' "${UPDATE_ALL_ASKPASS_CONTEXT:-}" >"$ASKPASS_CONTEXT_CAPTURE"
         { stat -f '%Lp' "$(dirname "$SUDO_ASKPASS")"; stat -f '%Lp' "$SUDO_ASKPASS"; } | paste -sd ' ' - >"$ASKPASS_MODE_CAPTURE"
         [ -n "${SUDO_ASKPASS:-}" ] && [ -x "$SUDO_ASKPASS" ]
         exit 0
@@ -62,6 +63,7 @@ run_interactive_case() {
     local state_dir="$tmp_dir/$name-state"
     local capture="$tmp_dir/$name-askpass.txt"
     local mode_capture="$tmp_dir/$name-askpass-mode.txt"
+    local context_capture="$tmp_dir/$name-askpass-context.txt"
     mkdir -p "$state_dir"
 
     if [ -n "$configured_askpass" ]; then
@@ -69,6 +71,7 @@ run_interactive_case() {
             SUDO_ASKPASS="$configured_askpass" \
             ASKPASS_CAPTURE="$capture" \
             ASKPASS_MODE_CAPTURE="$mode_capture" \
+            ASKPASS_CONTEXT_CAPTURE="$context_capture" \
             CASKROOM="$tmp_dir/caskroom" \
             STATE_DIR="$state_dir" \
             PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
@@ -83,6 +86,7 @@ run_interactive_case() {
         script -q /dev/null env \
             ASKPASS_CAPTURE="$capture" \
             ASKPASS_MODE_CAPTURE="$mode_capture" \
+            ASKPASS_CONTEXT_CAPTURE="$context_capture" \
             CASKROOM="$tmp_dir/caskroom" \
             STATE_DIR="$state_dir" \
             PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
@@ -101,6 +105,12 @@ generated_askpass=$(cat "$tmp_dir/generated-askpass.txt")
 
 if [ -z "$generated_askpass" ]; then
     printf 'Expected an interactive run to configure SUDO_ASKPASS.\n' >&2
+    exit 1
+fi
+
+if ! grep -Fq 'not stored' "$tmp_dir/generated-askpass-context.txt"; then
+    printf 'The password dialog must explain the operation and storage policy.\n' >&2
+    cat "$tmp_dir/generated-askpass-context.txt" >&2
     exit 1
 fi
 

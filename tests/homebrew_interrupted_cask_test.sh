@@ -54,10 +54,14 @@ case "$*" in
     "info --cask regular-app")
         exit 0
         ;;
-    "reinstall --cask broken-app" | "reinstall --cask stubborn-app")
+    "upgrade --cask --greedy broken-app regular-app")
+        rm -rf "$CASKROOM/broken-app/1.0.upgrading"
         exit 0
         ;;
-    "upgrade --cask regular-app")
+    "upgrade --cask --greedy stubborn-app")
+        exit 1
+        ;;
+    "reinstall --cask stubborn-app")
         exit 0
         ;;
     "upgrade --formula formula-one")
@@ -92,18 +96,18 @@ CALLS_FILE="$calls_file" \
     --lock-dir "$tmp_dir/lock" \
     --only homebrew >/dev/null 2>&1
 
-if ! grep -Fxq 'brew reinstall --cask broken-app' "$calls_file"; then
-    printf 'Expected the interrupted cask to be repaired.\n' >&2
+if ! grep -Fxq 'brew upgrade --cask --greedy broken-app regular-app' "$calls_file"; then
+    printf 'Expected interrupted and ordinary casks in one Homebrew batch.\n' >&2
     cat "$calls_file" >&2
     exit 1
 fi
 
-repair_line=$(grep -nFx 'brew reinstall --cask broken-app' "$calls_file" | cut -d: -f1)
-cask_line=$(grep -nFx 'brew upgrade --cask regular-app' "$calls_file" | cut -d: -f1)
+repair_line=$(grep -nFx 'brew upgrade --cask --greedy broken-app regular-app' "$calls_file" | cut -d: -f1)
+cask_line="$repair_line"
 formula_line=$(grep -nFx 'brew upgrade --formula formula-one' "$calls_file" | cut -d: -f1)
 
-if [ "$repair_line" -ge "$cask_line" ] || [ "$cask_line" -ge "$formula_line" ]; then
-    printf 'Expected interrupted repair, then cask upgrade, then formula upgrade.\n' >&2
+if [ "$cask_line" -ge "$formula_line" ]; then
+    printf 'Expected the combined cask batch before the formula upgrade.\n' >&2
     cat "$calls_file" >&2
     exit 1
 fi
@@ -111,6 +115,12 @@ fi
 if ! grep -Fq 'Interrupted Homebrew cask upgrade found: broken-app' "$run_log"; then
     printf 'Expected a clear interrupted-cask diagnostic.\n' >&2
     cat "$run_log" >&2
+    exit 1
+fi
+
+if [ "$(grep -Ec '^brew (upgrade|reinstall|install|uninstall) --cask' "$calls_file")" -ne 1 ]; then
+    printf 'Normal interrupted recovery must use one mutating Homebrew cask process.\n' >&2
+    cat "$calls_file" >&2
     exit 1
 fi
 

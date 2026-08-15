@@ -238,9 +238,13 @@ Cleanup is its own selectable step: `--only homebrew` updates packages but does 
 caches; use `--only homebrew,cleanup` when both operations are wanted.
 
 If Homebrew finds a cask directory ending in `.upgrading`, the script reports the
-interrupted upgrade and tries a normal `brew reinstall --cask` before processing other
-updates. After a successful reinstall it removes that exact stale `.upgrading` directory.
-Forced uninstall remains disabled unless `--force-cask-repair` is explicitly used.
+interrupted upgrade and includes it in the same cask batch as ordinary app updates. This
+normally limits Homebrew to one password dialog because Homebrew deliberately resets its
+`sudo` timestamp for each separate process. A separate `brew reinstall --cask` runs only
+if the combined batch cannot recover an app; the terminal and password dialog identify
+that fallback before any additional password request. After a successful reinstall the
+script removes that exact stale `.upgrading` directory. Forced uninstall remains disabled
+unless `--force-cask-repair` is explicitly used.
 
 Homebrew formulae and casks pinned with `brew pin` are intentionally skipped. They are
 reported in the run log but do not make the Homebrew step fail; all unpinned outdated
@@ -310,6 +314,7 @@ If a previous run crashed, the script detects stale locks and removes them when 
 - Review scripts before running them from the internet.
 - Some updates can close, replace, or relaunch apps. The script warns when Homebrew cask apps appear to be running.
 - Interactive macOS runs configure a temporary `SUDO_ASKPASS` helper. If Homebrew needs administrator access, a native password dialog appears and the password is passed directly to `sudo`; it is never stored by the updater. Existing `SUDO_ASKPASS` configuration is preserved.
+- macOS can separately show an **App Management** notification when Terminal or another host app replaces software in `/Applications`. That notice is not another password request; macOS names the host process that launched the updater.
 - `--force-cask-repair` can uninstall and reinstall a cask as a recovery fallback. Use it only when you understand the risk.
 - The macOS step checks for system updates but does not install them.
 - A signed and notarized `.app` or `.pkg` would be required for the cleanest double-click Finder experience. This repository currently distributes a CLI script.
