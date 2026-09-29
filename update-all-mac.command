@@ -4,7 +4,7 @@
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
 # Date: 2026-08-15
-# Version: 3.4.0
+# Version: 3.4.1
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -30,9 +30,17 @@ DATE=$(date '+%Y-%m-%d %H:%M:%S')
 START_EPOCH=$(date +%s)
 LOCK_DIR="${UPDATE_ALL_LOCK_DIR:-/tmp/update-all-mac.lock}"
 LOCK_HELD=0
+LOCK_TOKEN="$$ $START_EPOCH"
+LOG_READY=0
 RUN_TEMP_DIR=""
 LAST_COMMAND_RECLAIMED=""
+LAST_COMMAND_OUTPUT=""
 ACTIVE_HEARTBEAT_PID=""
+ACTIVE_COMMAND_PID=""
+ACTIVE_COMMAND_PGID=""
+ACTIVE_STREAM_PID=""
+CURRENT_STEP_ID=""
+CURRENT_STEP_NAME=""
 PARALLEL_WORKER_PIDS=()
 
 STEP_IDS=("homebrew" "npm" "mas" "ohmyzsh" "pip" "pipx" "uv" "rust" "mise" "asdf" "gcloud" "cleanup")
@@ -448,63 +456,143 @@ log_detail() {
     printf '%s\n' "$message" | strip_ansi >&9
 }
 
-# Run an external command, streaming a color-stripped copy to the log and, in
-# verbose mode, mirroring it to the terminal. Returns the command's own exit
-# code (not tee's), so callers can branch on success/failure as usual.
-run_logged() {
-    local tmp="" rc=0
-    local heartbeat_pid=""
+# Read command output as it arrives. The command runs separately from this
+# reader, so a signal can interrupt wait and stop the command before cleanup.
+stream_command_output() {
+    local capture="$1"
+    local activity="$2"
+    local operation="$3"
+    local line=""
+    local event=""
+
+    exec 8>"$capture"
+    filter_benign_noise | strip_ansi_stream | while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line" >&8
+        printf '%s\n' "$line" >&9
+        printf '%s\n' "$SECONDS" >"$activity"
+        if [ "$VERBOSE" -eq 1 ]; then
+            printf '%s\n' "$line"
+        elif [ "$CURRENT_STEP_ID" = "homebrew" ] || [ "$operation" = "Homebrew metadata" ]; then
+            case "$line" in
+                '==> '*)
+                    event=${line#'==> '}
+                    printf '  ↳ %.180s\n' "$event"
+                    ;;
+            esac
+        fi
+    done
+}
+
+# Every external operation uses the same live log, progress and exit-code path.
+# Capture mode also returns its complete output in LAST_COMMAND_OUTPUT.
+run_command() {
+    local capture_mode="$1"
+    local operation="$2"
+    shift 2
+    local tmp="" fifo="" activity="" rc=0
+    local command_pid="" stream_pid="" heartbeat_pid=""
+    local SECONDS=0
 
     LAST_COMMAND_RECLAIMED=""
-    if ensure_run_temp_dir; then
-        tmp=$(mktemp "$RUN_TEMP_DIR/command.XXXXXX" 2>/dev/null) || tmp=""
+    LAST_COMMAND_OUTPUT=""
+    if ! ensure_run_temp_dir; then
+        log "${RED}  ⚠️  Could not create private command storage${NC}"
+        return 1
     fi
+    tmp=$(mktemp "$RUN_TEMP_DIR/command.XXXXXX" 2>/dev/null) || tmp=""
     if [ -z "$tmp" ]; then
-        # Could not create a temp file; preserve live terminal and log output.
-        start_heartbeat &
-        heartbeat_pid=$!
-        ACTIVE_HEARTBEAT_PID="$heartbeat_pid"
-        if [ "$VERBOSE" -eq 1 ]; then
-            "$@" 2>&1 | filter_benign_noise | strip_ansi_stream | tee /dev/fd/9
-        else
-            "$@" 2>&1 | filter_benign_noise | strip_ansi_stream >&9
-        fi
-        rc=${PIPESTATUS[0]}
-        stop_heartbeat "$heartbeat_pid"
-        return "$rc"
+        log "${RED}  ⚠️  Could not create private command storage${NC}"
+        return 1
     fi
+    fifo="$tmp.pipe"
+    activity="$tmp.activity"
+    if ! mkfifo "$fifo"; then
+        rm -f "$tmp"
+        log "${RED}  ⚠️  Could not prepare command output stream${NC}"
+        return 1
+    fi
+    : >"$activity"
 
-    # Keep a diagnostic tail while streaming every completed line into the
-    # canonical log. The previous implementation flushed the temp file only
-    # after command exit, losing the useful tail when a run was interrupted.
-    start_heartbeat &
+    stream_command_output "$tmp" "$activity" "$operation" <"$fifo" &
+    stream_pid=$!
+    ACTIVE_STREAM_PID="$stream_pid"
+    if [ "${IN_PARALLEL_WORKER:-0}" = 1 ]; then
+        "$@" </dev/null >"$fifo" 2>&1 &
+    else
+        # A separate process group also covers children that outlive the
+        # package-manager process but still hold its output pipe open.
+        set -m
+        "$@" </dev/null >"$fifo" 2>&1 &
+    fi
+    command_pid=$!
+    if [ "${IN_PARALLEL_WORKER:-0}" != 1 ]; then
+        set +m
+        ACTIVE_COMMAND_PGID="$command_pid"
+    fi
+    ACTIVE_COMMAND_PID="$command_pid"
+    start_heartbeat "$operation" "$activity" &
     heartbeat_pid=$!
     ACTIVE_HEARTBEAT_PID="$heartbeat_pid"
-    if [ "$VERBOSE" -eq 1 ]; then
-        "$@" 2>&1 | filter_benign_noise | tee "$tmp" | strip_ansi_stream | tee /dev/fd/9
-    else
-        "$@" 2>&1 | filter_benign_noise | tee "$tmp" | strip_ansi_stream >&9
-    fi
-    rc=${PIPESTATUS[0]}
+
+    wait "$command_pid" || rc=$?
+    wait "$stream_pid" 2>/dev/null || true
+    ACTIVE_COMMAND_PID=""
+    ACTIVE_COMMAND_PGID=""
+    ACTIVE_STREAM_PID=""
     stop_heartbeat "$heartbeat_pid"
-    if [ "$rc" -ne 0 ] && [ "$VERBOSE" -ne 1 ] && [ -s "$tmp" ]; then
+
+    if [ "$rc" -ne 0 ] && [ "$capture_mode" -eq 0 ] && [ "$VERBOSE" -ne 1 ] && [ -s "$tmp" ]; then
         printf '%s\n' "  ↳ Last command output (full details: $LOG_FILE):"
         tail -n 20 "$tmp"
     fi
     LAST_COMMAND_RECLAIMED=$(sed -nE 's/.*(has freed|would free) approximately ([^ ]+) of disk space.*/\2/p' "$tmp" 2>/dev/null | tail -n 1)
-    rm -f "$tmp"
+    if [ "$capture_mode" -eq 1 ]; then
+        LAST_COMMAND_OUTPUT=$(cat "$tmp")
+    fi
+    rm -f "$tmp" "$fifo" "$activity"
     return "$rc"
 }
 
+run_logged() {
+    run_command 0 "${CURRENT_STEP_NAME:-${1##*/}}" "$@"
+}
+
+run_logged_named() {
+    local operation="$1"
+    shift
+    run_command 0 "$operation" "$@"
+}
+
+run_logged_capture() {
+    local operation="$1"
+    shift
+    run_command 1 "$operation" "$@"
+}
+
 start_heartbeat() {
-    local elapsed=0
+    local operation="${1:-${CURRENT_STEP_NAME:-Update}}"
+    local activity="${2:-}"
+    local elapsed=0 last_activity=0 silence=0
 
     [[ "$HEARTBEAT_SECONDS" =~ ^[1-9][0-9]*$ ]] || return 0
     while sleep "$HEARTBEAT_SECONDS"; do
         elapsed=$((elapsed + HEARTBEAT_SECONDS))
-        printf '  … Still working (%ss; details: %s)\n' "$elapsed" "$LOG_FILE"
+        if [ -z "$activity" ]; then
+            printf '  … Still working on %s: %ss elapsed; results will appear when they finish.\n' \
+                "$operation" "$elapsed"
+            continue
+        fi
+        last_activity=0
+        if [ -f "$activity" ]; then
+            IFS= read -r last_activity <"$activity" || last_activity=0
+        fi
+        [[ "$last_activity" =~ ^[0-9]+$ ]] || last_activity=0
+        silence=$((elapsed - last_activity))
+        [ "$silence" -ge 0 ] || silence=0
+        printf '  … Still working on %s: %ss elapsed, no new output for %ss (log: %s)\n' \
+            "$operation" "$elapsed" "$silence" "$LOG_FILE"
         if [ "$elapsed" -eq $((HEARTBEAT_SECONDS * 2)) ] && [ "$VERBOSE" -ne 1 ]; then
-            printf '  … Compact mode hides command output; if input is expected, check the log or retry with --verbose.\n'
+            printf '  … Compact mode keeps full output in the log; if input is expected, check it or retry with --verbose.\n'
         fi
     done
 }
@@ -554,6 +642,7 @@ init_logging() {
     printf '\n==== [%s] Update run started ====\n' "$DATE" >>"$LOG_FILE"
     # fd 9 is the canonical log sink used by log() and run_logged().
     exec 9>>"$LOG_FILE"
+    LOG_READY=1
 }
 
 validate_lock_dir() {
@@ -579,28 +668,103 @@ cleanup_runtime() {
     temp_root=${temp_root%/}
 
     stop_heartbeat "$ACTIVE_HEARTBEAT_PID"
+    if [ -n "$ACTIVE_COMMAND_PGID" ]; then
+        terminate_process_group "$ACTIVE_COMMAND_PGID"
+    elif [ -n "$ACTIVE_COMMAND_PID" ]; then
+        terminate_process_tree "$ACTIVE_COMMAND_PID"
+    fi
+    if [ -n "$ACTIVE_STREAM_PID" ]; then
+        terminate_process_tree "$ACTIVE_STREAM_PID"
+    fi
     if [ ${#PARALLEL_WORKER_PIDS[@]} -gt 0 ]; then
         for pid in "${PARALLEL_WORKER_PIDS[@]}"; do
-            kill "$pid" 2>/dev/null || true
+            terminate_process_group "$pid"
         done
     fi
+    [ -z "$ACTIVE_COMMAND_PID" ] || wait "$ACTIVE_COMMAND_PID" 2>/dev/null || true
+    [ -z "$ACTIVE_STREAM_PID" ] || wait "$ACTIVE_STREAM_PID" 2>/dev/null || true
+    if [ ${#PARALLEL_WORKER_PIDS[@]} -gt 0 ]; then
+        for pid in "${PARALLEL_WORKER_PIDS[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
+    fi
+    ACTIVE_COMMAND_PID=""
+    ACTIVE_COMMAND_PGID=""
+    ACTIVE_STREAM_PID=""
     PARALLEL_WORKER_PIDS=()
 
     if [ -n "$RUN_TEMP_DIR" ] && [ -d "$RUN_TEMP_DIR" ]; then
         case "$RUN_TEMP_DIR" in
-            "$temp_root"/update-all-mac-run.*) rm -rf "$RUN_TEMP_DIR" ;;
+            "$temp_root"/update-all-mac-run.*)
+                if [ "$(cat "$RUN_TEMP_DIR/owner" 2>/dev/null)" = "$LOCK_TOKEN" ]; then
+                    rm -rf "$RUN_TEMP_DIR"
+                fi
+                ;;
         esac
     fi
 
     if [ "$LOCK_HELD" -eq 1 ]; then
-        rm -rf "$LOCK_DIR"
+        if [ "$(cat "$LOCK_DIR/owner" 2>/dev/null)" = "$LOCK_TOKEN" ] \
+            && [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+            rm -f "$LOCK_DIR/owner"
+            rm -f "$LOCK_DIR/pid"
+            rmdir "$LOCK_DIR" 2>/dev/null || true
+        fi
         LOCK_HELD=0
     fi
 }
 
+# Stop the command and its known descendants before deleting its scratch files.
+# A worker can contain its own command and output-reader processes.
+collect_process_tree() {
+    local pid="$1"
+    local child=""
+
+    PROCESS_TREE_PIDS+=("$pid")
+    while IFS= read -r child; do
+        [ -n "$child" ] && collect_process_tree "$child"
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+}
+
+terminate_process_tree() {
+    local root="${1:-}"
+    local pid=""
+    local signaled=0
+    local -a PROCESS_TREE_PIDS=()
+
+    [[ "$root" =~ ^[1-9][0-9]*$ ]] || return 0
+    collect_process_tree "$root"
+    for pid in "${PROCESS_TREE_PIDS[@]}"; do
+        if kill -TERM "$pid" 2>/dev/null; then
+            signaled=1
+        fi
+    done
+    if [ "$signaled" -eq 1 ]; then
+        sleep 1
+        for pid in "${PROCESS_TREE_PIDS[@]}"; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
+}
+
+terminate_process_group() {
+    local pgid="${1:-}"
+    local my_pgid=""
+
+    [[ "$pgid" =~ ^[1-9][0-9]*$ ]] || return 0
+    my_pgid=$(ps -p "$$" -o pgid= 2>/dev/null | tr -d '[:space:]')
+    if [ "$pgid" = "$my_pgid" ]; then
+        terminate_process_tree "$pgid"
+        return
+    fi
+    kill -TERM -- "-$pgid" 2>/dev/null || return 0
+    sleep 1
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+}
+
 handle_exit() {
     local rc=$?
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
     cleanup_runtime
     exit "$rc"
 }
@@ -609,14 +773,20 @@ handle_interrupt() {
     local signal="$1"
     local rc=130
 
+    [ "$signal" = "HUP" ] && rc=129
     [ "$signal" = "TERM" ] && rc=143
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT TERM
+    if [ "$LOG_READY" -eq 1 ]; then
+        printf 'Run interrupted by %s; stopping active commands.\n' "$signal" >&9
+    fi
+    printf 'Run interrupted by %s; stopping active commands.\n' "$signal" >&2
     cleanup_runtime
     exit "$rc"
 }
 
 install_runtime_traps() {
     trap 'handle_exit' EXIT
+    trap 'handle_interrupt HUP' HUP
     trap 'handle_interrupt INT' INT
     trap 'handle_interrupt TERM' TERM
 }
@@ -630,13 +800,17 @@ ensure_run_temp_dir() {
     fi
 
     RUN_TEMP_DIR=$(mktemp -d "$temp_root/update-all-mac-run.XXXXXX" 2>/dev/null) || RUN_TEMP_DIR=""
-    [ -n "$RUN_TEMP_DIR" ]
+    [ -n "$RUN_TEMP_DIR" ] || return 1
+    chmod 700 "$RUN_TEMP_DIR"
+    printf '%s\n' "$LOCK_TOKEN" >"$RUN_TEMP_DIR/owner"
 }
 
 cleanup_stale_temp_artifacts() {
     local temp_root="${TMPDIR:-/tmp}"
     local path=""
     local current_uid=""
+    local owner=""
+    local owner_pid=""
 
     [ "$DRY_RUN" -ne 1 ] || return 0
     [[ "$TEMP_MAX_AGE_MINUTES" =~ ^[1-9][0-9]*$ ]] || return 0
@@ -645,19 +819,14 @@ cleanup_stale_temp_artifacts() {
     current_uid=$(id -u)
 
     while IFS= read -r -d '' path; do
-        case "$path" in
-            "$LOG_FILE" | "$LOG_FILE.1") continue ;;
-        esac
-        case "${path##*/}" in
-            update-all-mac.*) rm -f "$path" ;;
-        esac
-    done < <(find "$temp_root" -maxdepth 1 -type f -user "$current_uid" -name 'update-all-mac.*' -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
-
-    while IFS= read -r -d '' path; do
-        case "${path##*/}" in
-            update-all-mac-parallel.* | update-all-mac-run.*) rm -rf "$path" ;;
-        esac
-    done < <(find "$temp_root" -maxdepth 1 -type d -user "$current_uid" \( -name 'update-all-mac-parallel.*' -o -name 'update-all-mac-run.*' \) -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
+        [ -f "$path/owner" ] && [ ! -L "$path/owner" ] || continue
+        owner=$(cat "$path/owner" 2>/dev/null || true)
+        owner_pid=${owner%% *}
+        [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || continue
+        if ! kill -0 "$owner_pid" 2>/dev/null; then
+            rm -rf "$path"
+        fi
+    done < <(find "$temp_root" -maxdepth 1 -type d -user "$current_uid" -name 'update-all-mac-run.*' -mmin "+$TEMP_MAX_AGE_MINUTES" -print0 2>/dev/null)
 }
 
 setup_gui_password_prompt() {
@@ -700,33 +869,44 @@ set_password_context() {
 
 acquire_lock() {
     local pid_file="$LOCK_DIR/pid"
+    local owner_file="$LOCK_DIR/owner"
     local pid=""
+    local stale=0
 
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        printf '%s\n' "$$" >"$pid_file" 2>/dev/null || true
-        LOCK_HELD=1
-        return 0
+    if [ -L "$LOCK_DIR" ]; then
+        printf 'Unsafe lock directory: %s\n' "$LOCK_DIR" >&2
+        return 1
     fi
-
-    # Lock already exists — try to detect stale lock and recover.
-    if [ -f "$pid_file" ]; then
-        IFS= read -r pid <"$pid_file" || pid=""
-    fi
-
-    if [ -z "$pid" ] || ! [[ "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
-        log "${YELLOW}⚠️  Found a stale lock (${LOCK_DIR}); removing it and trying again...${NC}"
-        rm -rf "$LOCK_DIR" 2>/dev/null || true
-
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            printf '%s\n' "$$" >"$pid_file" 2>/dev/null || true
-            LOCK_HELD=1
-            return 0
+    if ! mkdir -m 700 "$LOCK_DIR" 2>/dev/null; then
+        if [ ! -d "$LOCK_DIR" ]; then
+            printf 'Could not create lock directory: %s\n' "$LOCK_DIR" >&2
+            return 1
         fi
     fi
 
-    log "${RED}⚠️  Another run appears to be active (${LOCK_DIR}).${NC}"
-    log "${YELLOW}   Wait for the previous run to finish, then try again.${NC}"
-    return 1
+    if [ -f "$pid_file" ]; then
+        IFS= read -r pid <"$pid_file" || pid=""
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+            stale=1
+        fi
+    fi
+
+    # shlock uses an atomic link and checks whether the old PID is alive.
+    # This avoids two simultaneous stale-lock removals deleting a new lock.
+    if ! /usr/bin/shlock -f "$pid_file" -p "$$"; then
+        printf 'Another run appears to be active (%s).\n' "$LOCK_DIR" >&2
+        return 1
+    fi
+    if ! printf '%s\n' "$LOCK_TOKEN" >"$owner_file"; then
+        rm -f "$pid_file"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        return 1
+    fi
+    LOCK_HELD=1
+    if [ "$stale" -eq 1 ]; then
+        printf 'Found a stale lock (%s); recovered it.\n' "$LOCK_DIR" >&2
+    fi
+    return 0
 }
 
 # Print the banner that introduces a step.
@@ -782,6 +962,8 @@ run_step() {
 
     step_header "$step_num" "$total_steps" "$step_idx"
 
+    CURRENT_STEP_ID="${STEP_IDS[$step_idx]}"
+    CURRENT_STEP_NAME="${STEP_NAMES[$step_idx]}"
     "$step_func"
     rc=$?
 
@@ -808,6 +990,8 @@ run_step_worker() {
     local step_func="${STEP_FUNCS[$step_idx]}"
 
     (
+        set +m
+        IN_PARALLEL_WORKER=1
         # Keep terminal presentation separate from the complete log transport.
         # This preserves compact output without losing command diagnostics.
         exec >"$seg" 2>&1
@@ -815,6 +999,8 @@ run_step_worker() {
         # The parent reports one heartbeat while it waits. Worker heartbeats
         # would be stale by the time their captured segments are replayed.
         HEARTBEAT_SECONDS=0
+        CURRENT_STEP_ID="${STEP_IDS[$step_idx]}"
+        CURRENT_STEP_NAME="${STEP_NAMES[$step_idx]}"
         "$step_func"
         printf '%s' "$?" >"$rcfile"
     )
@@ -900,7 +1086,9 @@ run_steps_parallel() {
             : >"$seg"
             : >"$logseg"
             printf '%s' "$STEP_FAIL" >"$rcfile"
+            set -m
             run_step_worker "$idx" "$seg" "$logseg" "$rcfile" &
+            set +m
             bg_idx+=("$idx")
             bg_pid+=("$!")
             PARALLEL_WORKER_PIDS+=("$!")
@@ -925,7 +1113,7 @@ run_steps_parallel() {
 
     # Wait for the background batch to finish.
     if [ "${#bg_pid[@]}" -gt 0 ]; then
-        start_heartbeat &
+        start_heartbeat "Parallel package managers" &
         wait_heartbeat_pid=$!
         ACTIVE_HEARTBEAT_PID="$wait_heartbeat_pid"
         for i in "${!bg_pid[@]}"; do
@@ -1097,9 +1285,9 @@ check_running_apps() {
 
 brew_update_catalog() {
     if brew help update-if-needed >/dev/null 2>&1; then
-        run_logged env HOMEBREW_NO_ENV_HINTS=1 brew update-if-needed
+        run_logged_named "Homebrew metadata" env HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_VERBOSE=1 brew update-if-needed
     else
-        run_logged env HOMEBREW_NO_ENV_HINTS=1 brew update
+        run_logged_named "Homebrew metadata" env HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_VERBOSE=1 brew update
     fi
 }
 
@@ -1210,9 +1398,21 @@ update_homebrew() {
     fi
 
     log "  → Checking for outdated packages..."
-    outdated_formulae_raw=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet 2>/dev/null || true)
-    outdated_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
-    pinned_packages_raw=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew list --pinned 2>/dev/null || true)
+    if ! run_logged_capture "Checking Homebrew formulae" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet; then
+        log "${RED}  ⚠️  Could not check outdated Homebrew formulae${NC}"
+        return "$STEP_FAIL"
+    fi
+    outdated_formulae_raw="$LAST_COMMAND_OUTPUT"
+    if ! run_logged_capture "Checking Homebrew apps" brew_cask_outdated; then
+        log "${RED}  ⚠️  Could not check outdated Homebrew apps${NC}"
+        return "$STEP_FAIL"
+    fi
+    outdated_casks_raw="$LAST_COMMAND_OUTPUT"
+    if ! run_logged_capture "Checking pinned Homebrew packages" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew list --pinned; then
+        log "${RED}  ⚠️  Could not check pinned Homebrew packages${NC}"
+        return "$STEP_FAIL"
+    fi
+    pinned_packages_raw="$LAST_COMMAND_OUTPUT"
 
     while IFS= read -r line; do
         [ -n "$line" ] && outdated_formulae+=("$line")
@@ -1411,18 +1611,21 @@ update_npm() {
     local outdated_output=""
     local outdated_exit=0
     local leftover=""
+    local leftover_exit=0
     local had_warn=0
     local rc=0
     local npm_net=(--fetch-retries=2 --fetch-timeout=60000)
 
     log "  → Checking for outdated packages..."
-    outdated_output=$(npm outdated -g --depth=0 "${npm_net[@]}" 2>&1)
+    run_logged_capture "Checking npm global packages" npm outdated -g --depth=0 "${npm_net[@]}"
     outdated_exit=$?
+    outdated_output="$LAST_COMMAND_OUTPUT"
 
     # A failed check (network/registry) must not be mistaken for "updates
     # available" — otherwise a blind `npm update -g` runs against a broken
     # connection (and may hang).
-    if npm_output_has_error "$outdated_output" || [ "$outdated_exit" -gt 1 ]; then
+    if npm_output_has_error "$outdated_output" || [ "$outdated_exit" -gt 1 ] \
+        || { [ "$outdated_exit" -ne 0 ] && [ -z "$outdated_output" ]; }; then
         log "${RED}  ⚠️  Could not check global npm packages (network or registry error)${NC}"
         log "$outdated_output"
         return "$STEP_FAIL"
@@ -1432,8 +1635,6 @@ update_npm() {
         log "  ${GREEN}→ Global npm packages are up to date${NC}"
         return "$STEP_OK"
     fi
-
-    log_detail "$outdated_output"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  ${BLUE}[dry-run] would run: npm update -g${NC}"
@@ -1455,8 +1656,15 @@ update_npm() {
 
     # Verify the upgrade actually cleared the outdated packages (e.g. a global
     # left behind on an older major). Mirrors the Homebrew cask re-check.
-    leftover=$(npm outdated -g --depth=0 "${npm_net[@]}" 2>&1)
-    if ! npm_output_has_error "$leftover" && [ -n "$leftover" ]; then
+    run_logged_capture "Verifying npm global packages" npm outdated -g --depth=0 "${npm_net[@]}"
+    leftover_exit=$?
+    leftover="$LAST_COMMAND_OUTPUT"
+    if npm_output_has_error "$leftover" || [ "$leftover_exit" -gt 1 ] \
+        || { [ "$leftover_exit" -ne 0 ] && [ -z "$leftover" ]; }; then
+        log "${YELLOW}  ⚠️  Could not verify global npm packages after upgrade${NC}"
+        [ -z "$leftover" ] || log "$leftover"
+        had_warn=1
+    elif [ -n "$leftover" ]; then
         log "${YELLOW}  ⚠️  Some global npm packages are still outdated after upgrade:${NC}"
         log "$leftover"
         had_warn=1
@@ -1485,19 +1693,19 @@ update_mas() {
     fi
 
     log "  → Checking for updates..."
-    if ! outdated_output=$(mas outdated "$accuracy_arg" 2>&1); then
+    if ! run_logged_capture "Checking Mac App Store apps" mas outdated "$accuracy_arg"; then
+        outdated_output="$LAST_COMMAND_OUTPUT"
         log "${RED}  ⚠️  Could not get the Mac App Store update list${NC}"
         log "  → $outdated_output"
         log "${YELLOW}     mas uses Spotlight; check App Store app indexing if this error repeats${NC}"
         return "$STEP_FAIL"
     fi
+    outdated_output="$LAST_COMMAND_OUTPUT"
 
     if [ -z "$outdated_output" ]; then
         log "  ${GREEN}→ No Mac App Store updates found${NC}"
         return "$STEP_OK"
     fi
-
-    log_detail "$outdated_output"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log "  ${BLUE}[dry-run] would run: mas upgrade${NC}"
@@ -1639,8 +1847,9 @@ update_uv() {
                 return 1
             fi
 
-            brew_outdated_output=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet uv 2>&1)
+            run_logged_capture "Checking Homebrew uv" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet uv
             brew_outdated_exit=$?
+            brew_outdated_output="$LAST_COMMAND_OUTPUT"
             if [ "$brew_outdated_exit" -ne 0 ]; then
                 log "${RED}  ⚠️  Could not check the Homebrew uv formula${NC}"
                 log "  → $brew_outdated_output"
@@ -1657,11 +1866,12 @@ update_uv() {
             fi
         fi
     else
-        uv_output=$(uv self update 2>&1)
+        run_logged_capture "Updating uv" uv self update
         uv_exit=$?
+        uv_output="$LAST_COMMAND_OUTPUT"
 
         if [ "$uv_exit" -eq 0 ]; then
-            [ -n "$uv_output" ] && log "$uv_output"
+            :
         elif printf '%s\n' "$uv_output" | grep -Eiq 'self[- ]?update.*disabled|package manager|managed by'; then
             log "  ${YELLOW}→ uv self update is unavailable for this installation type${NC}"
             log "  ${YELLOW}→ Update uv with the package manager that installed it${NC}"
@@ -1790,9 +2000,9 @@ update_gcloud() {
     local rc=0
 
     log "  → Updating gcloud components..."
-    output=$(gcloud components update --quiet 2>&1)
+    run_logged_capture "Updating gcloud components" gcloud components update --quiet
     rc=$?
-    [ -n "$output" ] && log "$output"
+    output="$LAST_COMMAND_OUTPUT"
 
     if [ "$rc" -eq 0 ]; then
         return "$STEP_OK"
@@ -1895,8 +2105,9 @@ check_macos_updates() {
     local rc=0
 
     log "  → Checking for macOS updates..."
-    output=$(softwareupdate -l 2>&1)
+    run_logged_capture "Checking macOS updates" softwareupdate -l
     rc=$?
+    output="$LAST_COMMAND_OUTPUT"
 
     [ -n "$output" ] && log "$output"
 
@@ -1987,13 +2198,13 @@ fi
 init_step_selection
 
 validate_lock_dir
-init_logging
 init_step_tracking
 install_runtime_traps
 
 if ! acquire_lock; then
     exit 1
 fi
+init_logging
 
 cleanup_stale_temp_artifacts
 

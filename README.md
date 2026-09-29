@@ -2,7 +2,7 @@
 
 One-command macOS updater for Homebrew formulae and casks, Mac App Store apps, global npm packages, Oh My Zsh, pipx packages, uv tools, Rust/cargo, mise, asdf, gcloud components, and optional macOS update checks.
 
-Current version: **3.4.0**
+Current version: **3.4.1**
 
 The recommended installation path is Homebrew. It avoids the common macOS Gatekeeper friction that happens when unsigned `.command` files are downloaded through a browser and opened from Finder.
 
@@ -293,15 +293,20 @@ By default, logs are written to:
 ~/Library/Logs/update-all-mac.log
 ```
 
-Each step's full command output is written to the log in real time, so an interrupted
-upgrade can be diagnosed from its final completed line. The terminal shows compact
-progress and a periodic heartbeat by default; use `--verbose` for the full stream. When
-the log grows past `UPDATE_ALL_LOG_MAX_BYTES` (1 MiB by default), it is rotated once to
-`update-all-mac.log.1` before the next run starts.
+Sequential commands write their full output to the log in real time, so an interrupted
+upgrade can be diagnosed from its final completed line. In `--parallel` mode, background
+steps keep separate temporary output and append it to the log when they finish. The
+terminal shows Homebrew's main progress events and a periodic heartbeat naming the
+current operation, elapsed time, and how long it has produced no output. Long checks of
+other package managers use the same heartbeat. Use `--verbose` for the full stream.
+When the log grows past `UPDATE_ALL_LOG_MAX_BYTES` (1 MiB by default), it is rotated
+once to `update-all-mac.log.1` before the next run starts.
 
 Current-run temporary files live in one private directory and are removed through a
-single exit/signal cleanup path. On the next non-dry run, updater-owned temporary files
-older than `UPDATE_ALL_TEMP_MAX_AGE_MINUTES` are removed by exact filename patterns.
+single exit/signal cleanup path after active commands stop. On the next non-dry run,
+private run directories older than `UPDATE_ALL_TEMP_MAX_AGE_MINUTES` are removed only
+when their recorded owner process is gone. Other files in the temporary directory are
+left alone.
 
 A lock directory prevents concurrent runs:
 
@@ -309,7 +314,10 @@ A lock directory prevents concurrent runs:
 /tmp/update-all-mac.lock
 ```
 
-If a previous run crashed, the script detects stale locks and removes them when safe.
+The lock is acquired before the log is opened or rotated, so a second run cannot change
+an active run's log. If a previous run crashed, the script detects stale locks and
+removes them when safe. Closing the terminal or sending HUP, INT, or TERM stops active
+commands before the lock and temporary files are removed.
 
 ## Safety Notes
 

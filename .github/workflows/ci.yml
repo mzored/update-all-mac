@@ -47,12 +47,15 @@ jobs:
           tests/run_logged_capture_test.sh
           tests/streaming_log_test.sh
           tests/compact_output_test.sh
+          tests/homebrew_progress_test.sh
 
       - name: Run npm post-upgrade check test
         run: tests/npm_postcheck_warn_test.sh
 
       - name: Run log rotation test
-        run: tests/log_rotation_test.sh
+        run: |
+          tests/log_rotation_test.sh
+          tests/lock_order_test.sh
 
       - name: Run parallel steps test
         run: |
@@ -79,6 +82,7 @@ jobs:
           tests/cleanup_test.sh
           tests/temp_cleanup_test.sh
           tests/signal_cleanup_test.sh
+          tests/interrupt_cleanup_test.sh
 
       - name: Check Homebrew formula
         run: |

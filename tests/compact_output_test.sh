@@ -18,6 +18,9 @@ set -euo pipefail
 
 case "${1:-}" in
     outdated)
+        if [ "${SLOW_OUTDATED:-0}" = 1 ] && [ ! -f "$STATE_DIR/upgraded" ]; then
+            sleep 2
+        fi
         if [ -f "$STATE_DIR/upgraded" ]; then
             exit 0
         fi
@@ -45,6 +48,7 @@ run_case() {
     mkdir -p "$state_dir"
 
     MARKER="$marker" \
+        SLOW_OUTDATED="${SLOW_OUTDATED:-0}" \
         STATE_DIR="$state_dir" \
         PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" \
         HOME="$tmp_dir/home" \
@@ -94,5 +98,12 @@ run_case verbose --verbose
 if ! grep -Fq "$marker" "$tmp_dir/verbose-stdout.log"; then
     printf -- '--verbose must print raw command details.\n' >&2
     cat "$tmp_dir/verbose-stdout.log" >&2
+    exit 1
+fi
+
+SLOW_OUTDATED=1 run_case slow-check
+if ! grep -Fq 'Still working on Checking npm global packages' "$tmp_dir/slow-check-stdout.log"; then
+    printf 'A slow read-only check did not show its operation and wait time.\n' >&2
+    cat "$tmp_dir/slow-check-stdout.log" >&2
     exit 1
 fi

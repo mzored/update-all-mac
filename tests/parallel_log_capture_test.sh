@@ -68,3 +68,8 @@ if ! grep -Fq 'Still working' "$stdout_file"; then
     cat "$stdout_file" >&2
     exit 1
 fi
+if ! grep -Fq 'Parallel package managers' "$stdout_file"; then
+    printf 'Parallel waiting must name the work still running.\n' >&2
+    cat "$stdout_file" >&2
+    exit 1
+fi
