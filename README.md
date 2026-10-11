@@ -2,7 +2,7 @@
 
 One-command macOS updater for Homebrew formulae and casks, Mac App Store apps, global npm packages, Oh My Zsh, pipx packages, uv tools, Rust/cargo, mise, asdf, gcloud components, and optional macOS update checks.
 
-Current version: **3.4.1**
+Current version: **3.4.2**
 
 The recommended installation path is Homebrew. It avoids the common macOS Gatekeeper friction that happens when unsigned `.command` files are downloaded through a browser and opened from Finder.
 
@@ -252,6 +252,12 @@ Homebrew formulae and casks pinned with `brew pin` are intentionally skipped. Th
 reported in the run log but do not make the Homebrew step fail; all unpinned outdated
 packages continue to update normally.
 
+Homebrew package lists are read from stdout separately from diagnostic output, so
+warnings from third-party taps cannot become package names. Failed discovery or
+verification stops the affected operation. A recovered cask upgrade is reported as a
+warning; an unresolved error fails the step. The final banner distinguishes success,
+warnings, and failures, including when `--exit-zero` overrides the process exit code.
+
 ## Environment Variables
 
 Every CLI option has an environment-friendly path for automation:
@@ -344,6 +350,20 @@ xattr -d com.apple.quarantine update-all-mac.command
 ```
 
 If `mas` cannot see updates, make sure App Store apps are indexed by Spotlight and that you are signed in to the App Store.
+
+If a Homebrew formula upgrade reports a `brew link` conflict, the new version may be
+installed while another installation still owns its command names. The updater shows
+the first error and keeps the step failed. Choose one installation method for the
+conflicting tool; the updater does not delete or overwrite another manager's files.
+
+For example, pnpm installed through Homebrew or global npm can conflict with Corepack's
+`pnpm` and `pnpx` shims. If you use Corepack to select project-specific pnpm versions,
+remove the duplicate pnpm installations through their original package managers, then
+restore the shims with `corepack enable pnpm`. Check installed dependents before removing
+a Homebrew formula. This is a manual environment repair, not part of normal updates.
+
+Deprecation warnings from a third-party tap remain in the log and should be addressed
+in that tap. They do not by themselves mean an installed app failed to update.
 
 ## License
 

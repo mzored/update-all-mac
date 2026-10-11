@@ -35,6 +35,9 @@ jobs:
           tests/homebrew_pinned_formula_test.sh
           tests/homebrew_pinned_cask_test.sh
           tests/homebrew_no_outdated_casks_test.sh
+          tests/homebrew_query_contract_test.sh
+          tests/homebrew_failure_summary_test.sh
+          tests/homebrew_heartbeat_test.sh
 
       - name: Run uv detection regression test
         run: tests/uv_homebrew_direct_detection_test.sh

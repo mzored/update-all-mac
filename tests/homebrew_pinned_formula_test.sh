@@ -19,6 +19,10 @@ set -euo pipefail
 printf 'brew %s\n' "$*" >>"$CALLS_FILE"
 
 case "$*" in
+    "--caskroom")
+        printf '%s/caskroom\n' "$HOME"
+        exit 0
+        ;;
     "help update-if-needed" | "update-if-needed" | "cleanup" | \
         "outdated --cask --quiet")
         exit 0

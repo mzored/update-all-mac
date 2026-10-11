@@ -26,7 +26,12 @@ require_text 'brew untap mzored/tap'
 require_text 'macOS Gatekeeper'
 require_text 'Download ZIP'
 require_text 'xattr -d com.apple.quarantine update-all-mac.command'
-require_text 'Current version: **3.4.1**'
+script_version=$(sed -n 's/^# Version: //p' "$(dirname "$readme")/update-all-mac.command")
+[ -n "$script_version" ] || {
+    printf 'Missing script version.\n' >&2
+    exit 1
+}
+require_text "Current version: **$script_version**"
 require_text '--verbose'
 require_text '--deep-clean'
 require_text 'UPDATE_ALL_VERBOSE=1'

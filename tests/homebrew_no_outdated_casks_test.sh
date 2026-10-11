@@ -15,6 +15,10 @@ cat >"$tmp_dir/bin/brew" <<'BREW_STUB'
 set -euo pipefail
 
 case "$*" in
+    "--caskroom")
+        printf '%s/caskroom\n' "$HOME"
+        exit 0
+        ;;
     "help update-if-needed" | "update-if-needed" | "cleanup" | \
         "outdated --formula --quiet" | "outdated --cask --quiet" | \
         "list --pinned")

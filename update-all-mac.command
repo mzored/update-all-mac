@@ -4,7 +4,7 @@
 # Run by double-clicking in Finder or from Terminal
 # Author: MZored
 # Date: 2026-08-15
-# Version: 3.4.1
+# Version: 3.4.2
 
 # Important: do not use set -e, so later steps can continue after an error
 set -uo pipefail
@@ -35,10 +35,12 @@ LOG_READY=0
 RUN_TEMP_DIR=""
 LAST_COMMAND_RECLAIMED=""
 LAST_COMMAND_OUTPUT=""
+LAST_COMMAND_STDOUT=""
 ACTIVE_HEARTBEAT_PID=""
 ACTIVE_COMMAND_PID=""
 ACTIVE_COMMAND_PGID=""
 ACTIVE_STREAM_PID=""
+ACTIVE_STDOUT_PID=""
 CURRENT_STEP_ID=""
 CURRENT_STEP_NAME=""
 PARALLEL_WORKER_PIDS=()
@@ -490,11 +492,13 @@ run_command() {
     local operation="$2"
     shift 2
     local tmp="" fifo="" activity="" rc=0
-    local command_pid="" stream_pid="" heartbeat_pid=""
-    local SECONDS=0
+    local command_pid="" stream_pid="" heartbeat_pid="" stdout_pid=""
+    local stdout_fifo="" stdout_capture=""
+    local started=$SECONDS
 
     LAST_COMMAND_RECLAIMED=""
     LAST_COMMAND_OUTPUT=""
+    LAST_COMMAND_STDOUT=""
     if ! ensure_run_temp_dir; then
         log "${RED}  ⚠️  Could not create private command storage${NC}"
         return 1
@@ -511,18 +515,35 @@ run_command() {
         log "${RED}  ⚠️  Could not prepare command output stream${NC}"
         return 1
     fi
-    : >"$activity"
+    printf '%s\n' "$started" >"$activity"
 
     stream_command_output "$tmp" "$activity" "$operation" <"$fifo" &
     stream_pid=$!
     ACTIVE_STREAM_PID="$stream_pid"
+    # Relay stdout into the existing combined stream while retaining a separate
+    # data channel. Diagnostics on stderr must never become package arguments.
+    stdout_fifo="$fifo"
+    if [ "$capture_mode" -eq 1 ]; then
+        stdout_fifo="$tmp.stdout.pipe"
+        stdout_capture="$tmp.stdout"
+        if ! mkfifo "$stdout_fifo"; then
+            terminate_process_tree "$stream_pid"
+            wait "$stream_pid" 2>/dev/null || true
+            ACTIVE_STREAM_PID=""
+            rm -f "$tmp" "$fifo" "$activity"
+            return 1
+        fi
+        tee "$stdout_capture" <"$stdout_fifo" >"$fifo" &
+        stdout_pid=$!
+        ACTIVE_STDOUT_PID="$stdout_pid"
+    fi
     if [ "${IN_PARALLEL_WORKER:-0}" = 1 ]; then
-        "$@" </dev/null >"$fifo" 2>&1 &
+        "$@" </dev/null >"$stdout_fifo" 2>"$fifo" &
     else
         # A separate process group also covers children that outlive the
         # package-manager process but still hold its output pipe open.
         set -m
-        "$@" </dev/null >"$fifo" 2>&1 &
+        "$@" </dev/null >"$stdout_fifo" 2>"$fifo" &
     fi
     command_pid=$!
     if [ "${IN_PARALLEL_WORKER:-0}" != 1 ]; then
@@ -530,26 +551,44 @@ run_command() {
         ACTIVE_COMMAND_PGID="$command_pid"
     fi
     ACTIVE_COMMAND_PID="$command_pid"
-    start_heartbeat "$operation" "$activity" &
+    start_heartbeat "$operation" "$activity" "$started" &
     heartbeat_pid=$!
     ACTIVE_HEARTBEAT_PID="$heartbeat_pid"
 
     wait "$command_pid" || rc=$?
+    if [ -n "$stdout_pid" ]; then
+        wait "$stdout_pid" || { [ "$rc" -ne 0 ] || rc=1; }
+    fi
     wait "$stream_pid" 2>/dev/null || true
     ACTIVE_COMMAND_PID=""
     ACTIVE_COMMAND_PGID=""
     ACTIVE_STREAM_PID=""
+    ACTIVE_STDOUT_PID=""
     stop_heartbeat "$heartbeat_pid"
 
-    if [ "$rc" -ne 0 ] && [ "$capture_mode" -eq 0 ] && [ "$VERBOSE" -ne 1 ] && [ -s "$tmp" ]; then
-        printf '%s\n' "  ↳ Last command output (full details: $LOG_FILE):"
-        tail -n 20 "$tmp"
+    if [ "$rc" -ne 0 ] && [ "$VERBOSE" -ne 1 ] && [ -s "$tmp" ]; then
+        # A batch may print many successful updates after its first failure.
+        # Keep that failure visible even when it is no longer in the tail.
+        awk '
+            !found && /^[[:space:]]*(Error:|error:|npm (error|ERR!))/ {
+                print "  ↳ First command error:"
+                found = 1
+                remaining = 12
+            }
+            remaining > 0 { print; remaining-- }
+        ' "$tmp"
+        if [ "$capture_mode" -eq 0 ]; then
+            printf '%s\n' "  ↳ Last command output (full details: $LOG_FILE):"
+            tail -n 20 "$tmp"
+        fi
     fi
     LAST_COMMAND_RECLAIMED=$(sed -nE 's/.*(has freed|would free) approximately ([^ ]+) of disk space.*/\2/p' "$tmp" 2>/dev/null | tail -n 1)
     if [ "$capture_mode" -eq 1 ]; then
         LAST_COMMAND_OUTPUT=$(cat "$tmp")
+        LAST_COMMAND_STDOUT=$(strip_ansi_stream <"$stdout_capture")
     fi
     rm -f "$tmp" "$fifo" "$activity"
+    [ -z "$stdout_capture" ] || rm -f "$stdout_capture" "$stdout_fifo"
     return "$rc"
 }
 
@@ -572,22 +611,23 @@ run_logged_capture() {
 start_heartbeat() {
     local operation="${1:-${CURRENT_STEP_NAME:-Update}}"
     local activity="${2:-}"
+    local started="${3:-$SECONDS}"
     local elapsed=0 last_activity=0 silence=0
 
     [[ "$HEARTBEAT_SECONDS" =~ ^[1-9][0-9]*$ ]] || return 0
     while sleep "$HEARTBEAT_SECONDS"; do
-        elapsed=$((elapsed + HEARTBEAT_SECONDS))
+        elapsed=$((SECONDS - started))
         if [ -z "$activity" ]; then
             printf '  … Still working on %s: %ss elapsed; results will appear when they finish.\n' \
                 "$operation" "$elapsed"
             continue
         fi
-        last_activity=0
+        last_activity=$started
         if [ -f "$activity" ]; then
-            IFS= read -r last_activity <"$activity" || last_activity=0
+            IFS= read -r last_activity <"$activity" || last_activity=$started
         fi
-        [[ "$last_activity" =~ ^[0-9]+$ ]] || last_activity=0
-        silence=$((elapsed - last_activity))
+        [[ "$last_activity" =~ ^[0-9]+$ ]] || last_activity=$started
+        silence=$((SECONDS - last_activity))
         [ "$silence" -ge 0 ] || silence=0
         printf '  … Still working on %s: %ss elapsed, no new output for %ss (log: %s)\n' \
             "$operation" "$elapsed" "$silence" "$LOG_FILE"
@@ -676,6 +716,9 @@ cleanup_runtime() {
     if [ -n "$ACTIVE_STREAM_PID" ]; then
         terminate_process_tree "$ACTIVE_STREAM_PID"
     fi
+    if [ -n "$ACTIVE_STDOUT_PID" ]; then
+        terminate_process_tree "$ACTIVE_STDOUT_PID"
+    fi
     if [ ${#PARALLEL_WORKER_PIDS[@]} -gt 0 ]; then
         for pid in "${PARALLEL_WORKER_PIDS[@]}"; do
             terminate_process_group "$pid"
@@ -683,6 +726,7 @@ cleanup_runtime() {
     fi
     [ -z "$ACTIVE_COMMAND_PID" ] || wait "$ACTIVE_COMMAND_PID" 2>/dev/null || true
     [ -z "$ACTIVE_STREAM_PID" ] || wait "$ACTIVE_STREAM_PID" 2>/dev/null || true
+    [ -z "$ACTIVE_STDOUT_PID" ] || wait "$ACTIVE_STDOUT_PID" 2>/dev/null || true
     if [ ${#PARALLEL_WORKER_PIDS[@]} -gt 0 ]; then
         for pid in "${PARALLEL_WORKER_PIDS[@]}"; do
             wait "$pid" 2>/dev/null || true
@@ -691,6 +735,7 @@ cleanup_runtime() {
     ACTIVE_COMMAND_PID=""
     ACTIVE_COMMAND_PGID=""
     ACTIVE_STREAM_PID=""
+    ACTIVE_STDOUT_PID=""
     PARALLEL_WORKER_PIDS=()
 
     if [ -n "$RUN_TEMP_DIR" ] && [ -d "$RUN_TEMP_DIR" ]; then
@@ -1145,15 +1190,24 @@ run_steps_parallel() {
 # Check for running GUI apps before cask upgrades
 get_primary_cask_app_path() {
     local cask="$1"
-    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew info --cask "$cask" 2>/dev/null | awk '/^\/Applications\/.*\.app$/ {print; exit}'
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew info --cask "$cask" 2>&9 | awk '/^\/Applications\/.*\.app$/ {print; exit}'
 }
 
 cask_app_missing() {
     local cask="$1"
     local app_path=""
 
-    app_path=$(get_primary_cask_app_path "$cask")
+    app_path=$(get_primary_cask_app_path "$cask") || return 2
     [ -n "$app_path" ] && [ ! -e "$app_path" ]
+}
+
+cask_needs_repair() {
+    local cask="$1"
+    if printf '%s\n' "$2" | grep -Fxq "$cask" \
+        || printf '%s\n' "$3" | grep -Fxq "$cask"; then
+        return 0
+    fi
+    cask_app_missing "$cask"
 }
 
 # Print cask tokens whose on-disk version directory shows that Homebrew was
@@ -1163,15 +1217,31 @@ find_interrupted_casks() {
     local caskroom=""
     local version_dir=""
     local cask_dir=""
+    local markers_file=""
+    local token=""
+    local rc=0
 
-    caskroom=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew --caskroom 2>/dev/null || true)
+    caskroom=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew --caskroom) || return 1
+    valid_caskroom "$caskroom" || return 1
     [ -d "$caskroom" ] || return 0
+    markers_file=$(mktemp "$RUN_TEMP_DIR/markers.XXXXXX") || return 1
+    if ! find "$caskroom" -mindepth 2 -maxdepth 2 -type d -name '*.upgrading' -print0 >"$markers_file"; then
+        rm -f "$markers_file"
+        return 1
+    fi
 
-    while IFS= read -r version_dir; do
-        [ -n "$version_dir" ] || continue
+    while IFS= read -r -d '' version_dir; do
         cask_dir=${version_dir%/*}
-        printf '%s\n' "${cask_dir##*/}"
-    done < <(find "$caskroom" -mindepth 2 -maxdepth 2 -type d -name '*.upgrading' -print 2>/dev/null)
+        token=${cask_dir##*/}
+        if ! valid_brew_package "$token"; then
+            printf 'Error: Invalid interrupted cask name: %s\n' "$token" >&2
+            rc=1
+            break
+        fi
+        printf '%s\n' "$token"
+    done <"$markers_file"
+    rm -f "$markers_file"
+    return "$rc"
 }
 
 # Remove only Homebrew's exact per-cask scratch directories after a successful
@@ -1179,17 +1249,14 @@ find_interrupted_casks() {
 remove_interrupted_cask_markers() {
     local cask="$1"
     local caskroom=""
-    local marker=""
 
-    case "$cask" in
-        "" | .* | */*) return 1 ;;
-    esac
-    caskroom=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew --caskroom 2>/dev/null || true)
+    valid_brew_package "$cask" || return 1
+    case "$cask" in */*) return 1 ;; esac
+    caskroom=$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew --caskroom 2>&9) || return 1
+    valid_caskroom "$caskroom" || return 1
     [ -d "$caskroom/$cask" ] || return 0
 
-    while IFS= read -r -d '' marker; do
-        rm -rf "$marker" || return 1
-    done < <(find "$caskroom/$cask" -mindepth 1 -maxdepth 1 -type d -name '*.upgrading' -print0 2>/dev/null)
+    find "$caskroom/$cask" -mindepth 1 -maxdepth 1 -type d -name '*.upgrading' -exec rm -rf -- {} + 2>&9
 }
 
 repair_casks() {
@@ -1198,6 +1265,7 @@ repair_casks() {
     local remaining_casks_raw=""
     local remaining_interrupted_raw=""
     local force_casks=()
+    local missing_rc=0
 
     [ "$#" -gt 0 ] || return 0
     log "  → Repairing cask batch: $# app(s)"
@@ -1216,13 +1284,16 @@ repair_casks() {
         return 1
     fi
 
-    remaining_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
-    remaining_interrupted_raw=$(find_interrupted_casks)
+    brew_capture_packages "Checking apps after failed reinstall" brew_cask_outdated || return 1
+    remaining_casks_raw="$LAST_COMMAND_STDOUT"
+    brew_capture_packages "Checking interrupted apps after failed reinstall" find_interrupted_casks || return 1
+    remaining_interrupted_raw="$LAST_COMMAND_STDOUT"
     for cask in "$@"; do
-        if printf '%s\n' "$remaining_casks_raw" | grep -Fxq "$cask" \
-            || printf '%s\n' "$remaining_interrupted_raw" | grep -Fxq "$cask" \
-            || cask_app_missing "$cask"; then
+        if cask_needs_repair "$cask" "$remaining_casks_raw" "$remaining_interrupted_raw"; then
             force_casks+=("$cask")
+        else
+            missing_rc=$?
+            [ "$missing_rc" -ne 2 ] || return 1
         fi
     done
 
@@ -1295,6 +1366,40 @@ brew_formula_installed() {
     local formula="$1"
 
     HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew list --formula "$formula" >/dev/null 2>&1
+}
+
+# Homebrew's quiet queries emit names on stdout and diagnostics on stderr.
+# Accept bare tokens and fully qualified tap names, never paths or options.
+valid_brew_package() {
+    local name="$1"
+    local token='[[:alnum:]_+][[:alnum:]_+.@-]*'
+    [[ "$name" =~ ^$token$ || "$name" =~ ^$token/$token/$token$ ]]
+}
+
+valid_caskroom() {
+    case "$1" in
+        /) return 1 ;;
+        /*) [[ "$1" != *$'\n'* ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+brew_capture_packages() {
+    local operation="$1"
+    local name=""
+    shift
+    if ! run_logged_capture "$operation" "$@"; then
+        log "${RED}  ⚠️  $operation failed${NC}"
+        [ -z "$LAST_COMMAND_OUTPUT" ] || log "$LAST_COMMAND_OUTPUT"
+        return 1
+    fi
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if ! valid_brew_package "$name"; then
+            log "${RED}  ⚠️  Invalid Homebrew package name from $operation: $name${NC}"
+            return 1
+        fi
+    done <<<"$LAST_COMMAND_STDOUT"
 }
 
 brew_cask_outdated() {
@@ -1378,6 +1483,7 @@ update_homebrew() {
     local interrupted_casks=()
     local recoverable_interrupted_casks=()
     local marker_retry_casks=()
+    local missing_rc=0
 
     log "  → Updating Homebrew metadata..."
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -1387,9 +1493,13 @@ update_homebrew() {
         had_error=1
     fi
 
+    if ! brew_capture_packages "Checking interrupted Homebrew apps" find_interrupted_casks; then
+        return "$STEP_FAIL"
+    fi
+    remaining_interrupted_raw="$LAST_COMMAND_STDOUT"
     while IFS= read -r cask; do
         [ -n "$cask" ] && interrupted_casks+=("$cask")
-    done < <(find_interrupted_casks)
+    done <<<"$remaining_interrupted_raw"
 
     if [ ${#interrupted_casks[@]} -gt 0 ]; then
         for cask in "${interrupted_casks[@]}"; do
@@ -1398,21 +1508,21 @@ update_homebrew() {
     fi
 
     log "  → Checking for outdated packages..."
-    if ! run_logged_capture "Checking Homebrew formulae" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet; then
+    if ! brew_capture_packages "Checking Homebrew formulae" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet; then
         log "${RED}  ⚠️  Could not check outdated Homebrew formulae${NC}"
         return "$STEP_FAIL"
     fi
-    outdated_formulae_raw="$LAST_COMMAND_OUTPUT"
-    if ! run_logged_capture "Checking Homebrew apps" brew_cask_outdated; then
+    outdated_formulae_raw="$LAST_COMMAND_STDOUT"
+    if ! brew_capture_packages "Checking Homebrew apps" brew_cask_outdated; then
         log "${RED}  ⚠️  Could not check outdated Homebrew apps${NC}"
         return "$STEP_FAIL"
     fi
-    outdated_casks_raw="$LAST_COMMAND_OUTPUT"
-    if ! run_logged_capture "Checking pinned Homebrew packages" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew list --pinned; then
+    outdated_casks_raw="$LAST_COMMAND_STDOUT"
+    if ! brew_capture_packages "Checking pinned Homebrew packages" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew list --pinned; then
         log "${RED}  ⚠️  Could not check pinned Homebrew packages${NC}"
         return "$STEP_FAIL"
     fi
-    pinned_packages_raw="$LAST_COMMAND_OUTPUT"
+    pinned_packages_raw="$LAST_COMMAND_STDOUT"
 
     while IFS= read -r line; do
         [ -n "$line" ] && outdated_formulae+=("$line")
@@ -1512,16 +1622,20 @@ update_homebrew() {
         fi
 
         if [ ${#casks_to_upgrade[@]} -gt 0 ] && ! brew_cask_upgrade "$interrupted_greedy_casks" "${casks_to_upgrade[@]}"; then
+            had_warn=1
             log "${YELLOW}  ⚠️  Some casks did not upgrade. Trying to repair the failed casks...${NC}"
 
-            remaining_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
-            remaining_interrupted_raw=$(find_interrupted_casks)
+            brew_capture_packages "Checking apps after failed upgrade" brew_cask_outdated || return "$STEP_FAIL"
+            remaining_casks_raw="$LAST_COMMAND_STDOUT"
+            brew_capture_packages "Checking interrupted apps after failed upgrade" find_interrupted_casks || return "$STEP_FAIL"
+            remaining_interrupted_raw="$LAST_COMMAND_STDOUT"
 
             for cask in "${casks_to_upgrade[@]}"; do
-                if printf '%s\n' "$remaining_casks_raw" | grep -Fxq "$cask" \
-                    || printf '%s\n' "$remaining_interrupted_raw" | grep -Fxq "$cask" \
-                    || cask_app_missing "$cask"; then
+                if cask_needs_repair "$cask" "$remaining_casks_raw" "$remaining_interrupted_raw"; then
                     failed_casks+=("$cask")
+                else
+                    missing_rc=$?
+                    [ "$missing_rc" -ne 2 ] || return "$STEP_FAIL"
                 fi
             done
 
@@ -1538,7 +1652,8 @@ update_homebrew() {
         # A command can exit successfully while an auto-updating cask remains
         # in its interrupted marker. Retry only those exceptional cases.
         if [ ${#recoverable_interrupted_casks[@]} -gt 0 ]; then
-            remaining_interrupted_raw=$(find_interrupted_casks)
+            brew_capture_packages "Verifying interrupted Homebrew apps" find_interrupted_casks || return "$STEP_FAIL"
+            remaining_interrupted_raw="$LAST_COMMAND_STDOUT"
             for cask in "${recoverable_interrupted_casks[@]}"; do
                 already_retried=0
                 if [ ${#failed_casks[@]} -gt 0 ] && printf '%s\n' "${failed_casks[@]}" | grep -Fxq "$cask"; then
@@ -1550,6 +1665,7 @@ update_homebrew() {
                 fi
             done
             if [ ${#marker_retry_casks[@]} -gt 0 ]; then
+                had_warn=1
                 log "${YELLOW}  🔐 Combined recovery left ${#marker_retry_casks[@]} app(s) interrupted; one additional password dialog may appear.${NC}"
                 set_password_context "Homebrew left ${#marker_retry_casks[@]} app(s) interrupted after the combined update. It is retrying them in one recovery batch. Your password is sent only to sudo and is not stored by update-all-mac."
                 if ! repair_casks "${marker_retry_casks[@]}"; then
@@ -1559,7 +1675,8 @@ update_homebrew() {
             fi
         fi
 
-        final_casks_raw=$(brew_cask_outdated 2>/dev/null || true)
+        brew_capture_packages "Verifying Homebrew apps" brew_cask_outdated || return "$STEP_FAIL"
+        final_casks_raw="$LAST_COMMAND_STDOUT"
         for cask in "${upgradeable_casks[@]}"; do
             if printf '%s\n' "$final_casks_raw" | grep -Fxq "$cask"; then
                 log "${RED}  ⚠️  Cask is still outdated after upgrade attempt: $cask${NC}"
@@ -1847,9 +1964,9 @@ update_uv() {
                 return 1
             fi
 
-            run_logged_capture "Checking Homebrew uv" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet uv
+            brew_capture_packages "Checking Homebrew uv" env HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew outdated --formula --quiet uv
             brew_outdated_exit=$?
-            brew_outdated_output="$LAST_COMMAND_OUTPUT"
+            brew_outdated_output="$LAST_COMMAND_STDOUT"
             if [ "$brew_outdated_exit" -ne 0 ]; then
                 log "${RED}  ⚠️  Could not check the Homebrew uv formula${NC}"
                 log "  → $brew_outdated_output"
@@ -2133,9 +2250,19 @@ print_summary() {
     seconds=$((elapsed % 60))
 
     log ""
-    log "${GREEN}╔════════════════════════════════════════════════╗${NC}"
-    log "${GREEN}║          🎉 UPDATE COMPLETE!            ║${NC}"
-    log "${GREEN}╚════════════════════════════════════════════════╝${NC}"
+    if [ "$ANY_STEP_FAILED" -ne 0 ]; then
+        log "${RED}╔════════════════════════════════════════════════╗${NC}"
+        log "${RED}║          ❌ UPDATE FAILED              ║${NC}"
+        log "${RED}╚════════════════════════════════════════════════╝${NC}"
+    elif [ "$ANY_STEP_WARN" -ne 0 ]; then
+        log "${YELLOW}╔════════════════════════════════════════════════╗${NC}"
+        log "${YELLOW}║       ⚠️ UPDATE COMPLETED WITH WARNINGS ║${NC}"
+        log "${YELLOW}╚════════════════════════════════════════════════╝${NC}"
+    else
+        log "${GREEN}╔════════════════════════════════════════════════╗${NC}"
+        log "${GREEN}║          🎉 UPDATE COMPLETE!            ║${NC}"
+        log "${GREEN}╚════════════════════════════════════════════════╝${NC}"
+    fi
     log ""
 
     log "${BLUE}📊 Run status:${NC}"
