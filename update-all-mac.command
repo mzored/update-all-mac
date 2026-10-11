@@ -613,9 +613,26 @@ start_heartbeat() {
     local activity="${2:-}"
     local started="${3:-$SECONDS}"
     local elapsed=0 last_activity=0 silence=0
+    local sleep_pid="" stopping=0
 
     [[ "$HEARTBEAT_SECONDS" =~ ^[1-9][0-9]*$ ]] || return 0
-    while sleep "$HEARTBEAT_SECONDS"; do
+    # An asynchronous wait lets the signal trap stop and reap our own sleeper.
+    # Killing only this shell would leave its foreground sleep orphaned.
+    trap 'stopping=1; [ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null || true' HUP INT TERM
+    while [ "$stopping" -eq 0 ]; do
+        sleep "$HEARTBEAT_SECONDS" &
+        sleep_pid=$!
+        # A signal may arrive between spawning sleep and recording its PID.
+        if [ "$stopping" -ne 0 ]; then
+            kill "$sleep_pid" 2>/dev/null || true
+        fi
+        wait "$sleep_pid" 2>/dev/null || stopping=1
+        if [ "$stopping" -ne 0 ]; then
+            kill "$sleep_pid" 2>/dev/null || true
+            wait "$sleep_pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep_pid=""
         elapsed=$((SECONDS - started))
         if [ -z "$activity" ]; then
             printf '  … Still working on %s: %ss elapsed; results will appear when they finish.\n' \

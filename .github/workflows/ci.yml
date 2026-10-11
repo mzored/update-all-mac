@@ -86,6 +86,7 @@ jobs:
           tests/temp_cleanup_test.sh
           tests/signal_cleanup_test.sh
           tests/interrupt_cleanup_test.sh
+          tests/capture_interrupt_cleanup_test.sh
 
       - name: Check Homebrew formula
         run: |
