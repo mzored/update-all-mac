@@ -35,12 +35,24 @@ chmod +x "$tmp_dir/bin/brew"
 export PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin"
 [ "$(command -v brew)" = "$tmp_dir/bin/brew" ] || exit 1
 failures=0
-fail() { printf '%s: %s\n' "$name" "$1" >&2; failures=$((failures + 1)); }
+fail() {
+    printf '%s: %s (updater exit %s)\n' "$name" "$1" "$rc" >&2
+    failures=$((failures + 1))
+    if [ "$diagnostics_printed" -eq 0 ]; then
+        diagnostics_printed=1
+        printf '%s\n' '--- fixture calls ---' >&2
+        cat "$state/calls" >&2
+        printf '%s\n' '--- updater stdout ---' >&2
+        cat "$state/stdout" >&2
+        printf '%s\n' '--- canonical log ---' >&2
+        cat "$state/run.log" >&2
+    fi
+}
 for activity in active silent; do
     for mode in compact verbose; do
         name="$activity-$mode"; state="$tmp_dir/$name"; mkdir -p "$state"
         args=(); [ "$mode" != verbose ] || args=(--verbose)
-        rc=0
+        rc=0; diagnostics_printed=0
         ACTIVITY="$activity" STATE="$state" CASKROOM="$tmp_dir/caskroom" HOME="$tmp_dir/home" \
             UPDATE_ALL_NO_PAUSE=1 UPDATE_ALL_HEARTBEAT_SECONDS=1 \
             /bin/bash "$script" --only homebrew --no-color --log-file "$state/run.log" \
