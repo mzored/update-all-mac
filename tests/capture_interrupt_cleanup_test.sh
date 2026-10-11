@@ -2,8 +2,9 @@
 set -euo pipefail
 set -m
 
-# Capture queries must stream both channels while running, then clean the
-# command tree, stdout relay, lock, and private storage after each signal.
+# Direct capture queries stream both channels while running; nested command
+# substitution streams stderr while retaining stdout as data. Each signal must
+# clean the command tree, stdout relay, lock, and private storage.
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 script=${UPDATER_TEST_SCRIPT:-$repo_root/update-all-mac.command}
 tmp_dir=$(mktemp -d)
@@ -40,6 +41,19 @@ printf '%s\n' "$*" >>"$STATE/calls"
 case "$*" in
     'help update-if-needed'|'update-if-needed') exit 0 ;;
     '--caskroom')
+        if [ "$SCENARIO" = homebrew-nested ]; then
+            printf '%s\n' "$$" >"$STATE/command-pid"
+            printf 'capture stdout marker\n'
+            printf 'capture stderr marker\n' >&2
+            sleep 30 &
+            child=$!
+            printf '%s\n' "$child" >"$STATE/child-pid"
+            touch "$STATE/started"
+            wait "$child"
+        else
+            printf '%s\n' "$STATE/caskroom"
+        fi ;;
+    'outdated --formula --quiet')
         printf '%s\n' "$$" >"$STATE/command-pid"
         printf 'capture stdout marker\n'
         printf 'capture stderr marker\n' >&2
@@ -75,24 +89,27 @@ fail() {
     [ ! -f "$state/run.log" ] || cat "$state/run.log" >&2
     exit 1
 }
-for manager in npm homebrew; do
+for manager in npm homebrew homebrew-nested; do
     for signal in HUP INT TERM; do
-        name="$manager-$signal"; state="$tmp_dir/$name"; mkdir -p "$state"
+        name="$manager-$signal"; state="$tmp_dir/$name"; mkdir -p "$state/caskroom"
         case "$signal" in HUP) expected_rc=129 ;; INT) expected_rc=130 ;; TERM) expected_rc=143 ;; esac
-        TMPDIR="$tmp_dir/system-tmp" STATE="$state" HOME="$tmp_dir/home" UPDATE_ALL_NO_PAUSE=1 \
-            /bin/bash "$script" --only "$manager" --no-color --verbose --log-file "$state/run.log" \
+        selection="$manager"; [ "$manager" != homebrew-nested ] || selection=homebrew
+        TMPDIR="$tmp_dir/system-tmp" STATE="$state" SCENARIO="$manager" HOME="$tmp_dir/home" UPDATE_ALL_NO_PAUSE=1 \
+            /bin/bash "$script" --only "$selection" --no-color --verbose --log-file "$state/run.log" \
             --lock-dir "$state/lock" >"$state/stdout" 2>&1 &
         updater_pid=$!
         ready=0
         for ((attempt=0; attempt<80; attempt++)); do
-            if [ -f "$state/started" ] && grep -Fq 'capture stdout marker' "$state/run.log" \
-                && grep -Fq 'capture stderr marker' "$state/run.log"; then ready=1; break; fi
+            if [ -f "$state/started" ] && grep -Fq 'capture stderr marker' "$state/run.log" \
+                && { [ "$manager" = homebrew-nested ] || grep -Fq 'capture stdout marker' "$state/run.log"; }; then ready=1; break; fi
             sleep 0.05
         done
-        [ "$ready" -eq 1 ] || fail 'query did not stream both channels before completion'
+        [ "$ready" -eq 1 ] || fail 'query did not stream expected channels before completion'
         [ -s "$state/calls" ] || fail 'fixture manager was not invoked'
         process_alive "$(cat "$state/command-pid")" || fail 'query exited before streaming assertions'
-        grep -Fq 'capture stdout marker' "$state/stdout" || fail 'verbose terminal lost stdout while query runs'
+        if [ "$manager" != homebrew-nested ]; then
+            grep -Fq 'capture stdout marker' "$state/stdout" || fail 'verbose terminal lost stdout while query runs'
+        fi
         grep -Fq 'capture stderr marker' "$state/stdout" || fail 'verbose terminal lost stderr while query runs'
         owned_pids=""
         collect_descendants "$updater_pid"
@@ -106,6 +123,10 @@ for manager in npm homebrew; do
         actual_rc=0
         wait "$updater_pid" 2>/dev/null || actual_rc=$?
         updater_pid=""
+        if grep -Fq 'setpgid' "$state/stdout"; then
+            printf '%s process-group diagnostic:\n' "$name" >&2
+            grep -F 'setpgid' "$state/stdout" >&2
+        fi
         [ "$actual_rc" -eq "$expected_rc" ] || fail "updater exited $actual_rc, expected $expected_rc"
         for pid in $owned_pids; do
             if process_alive "$pid"; then
