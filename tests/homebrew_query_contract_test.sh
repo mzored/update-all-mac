@@ -7,7 +7,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 script=${UPDATER_TEST_SCRIPT:-$repo_root/update-all-mac.command}
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
-mkdir -p "$tmp_dir/bin" "$tmp_dir/home" "$tmp_dir/caskroom"
+mkdir -p "$tmp_dir/bin" "$tmp_dir/home"
 cat >"$tmp_dir/bin/brew" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -30,6 +30,7 @@ case "$*" in
         case "$CASE" in
             valid) [ "$count" -ne 1 ] || printf 'valid-app\n' ;;
             malformed-cask) printf 'valid-app\n--bad-option\n' ;;
+            info-error) [ "$count" -ne 1 ] || printf 'valid-app\n' ;;
             recovery-error|postcheck-error|force-query-error)
                 if [ "$count" -eq 1 ]; then printf 'valid-app\n'
                 elif [ "$CASE" = force-query-error ] && [ "$count" -eq 2 ]; then printf 'valid-app\n'
@@ -39,10 +40,14 @@ case "$*" in
     'list --pinned')
         case "$CASE" in valid) printf 'pinned-tool\n' ;; malformed-pinned) printf 'invalid token\n' ;; esac
         printf 'Warning: pin query diagnostic\n' >&2 ;;
-    'list --cask'|'list --formula'|'info --cask valid-app') exit 0 ;;
+    'list --cask'|'list --formula') exit 0 ;;
+    'info --cask valid-app')
+        if [ "$CASE" = info-error ] && [ -f "$STATE/upgraded" ]; then printf 'Error: cask info unavailable\n' >&2; exit 7; fi
+        exit 0 ;;
     upgrade\ --formula*) exit 0 ;;
     upgrade\ --cask*)
-        case "$CASE" in recovery-error|force-query-error) exit 9 ;; esac ;;
+        touch "$STATE/upgraded"
+        case "$CASE" in recovery-error|force-query-error|info-error) exit 9 ;; esac ;;
     reinstall\ --cask*) exit 9 ;;
     uninstall\ --cask*|install\ --cask*) exit 0 ;;
     *) printf 'Unexpected brew command: %s\n' "$*" >&2; exit 64 ;;
@@ -54,10 +59,11 @@ export PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/loc
 [ "$(command -v brew)" = "$tmp_dir/bin/brew" ] || exit 1
 failures=0
 fail() { printf '%s: %s\n' "$name" "$1" >&2; failures=$((failures + 1)); }
-for name in valid empty malformed-formula malformed-cask malformed-pinned caskroom-error recovery-error postcheck-error force-query-error; do
-    state="$tmp_dir/$name"; mkdir -p "$state"
+for name in valid empty malformed-formula malformed-cask malformed-pinned caskroom-error malformed-interrupted recovery-error postcheck-error force-query-error info-error; do
+    state="$tmp_dir/$name"; mkdir -p "$state/caskroom"
+    [ "$name" != malformed-interrupted ] || mkdir -p "$state/caskroom/invalid token/1.0.upgrading"
     rc=0
-    CASE="$name" STATE="$state" CASKROOM="$tmp_dir/caskroom" HOME="$tmp_dir/home" \
+    CASE="$name" STATE="$state" CASKROOM="$state/caskroom" HOME="$tmp_dir/home" \
         PATH="$tmp_dir/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/opt/homebrew/sbin:/opt/homebrew/bin" UPDATE_ALL_NO_PAUSE=1 \
         /bin/bash "$script" --only homebrew --no-color --force-cask-repair \
         --log-file "$state/run.log" --lock-dir "$state/lock" >"$state/stdout" 2>&1 || rc=$?
