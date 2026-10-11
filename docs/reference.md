@@ -4,8 +4,6 @@
 
 ## Options
 
-Run `update-all-mac --help` for the command's built-in help.
-
 | Option | Effect |
 | --- | --- |
 | `--only <id1,id2>` | Run selected steps. |
@@ -98,9 +96,6 @@ Set boolean variables to `1` to enable them or `0` to disable them.
 | `UPDATE_ALL_NET_TIMEOUT` | npm update timeout. Default `600` seconds. Requires `gtimeout` or `timeout`. |
 | `UPDATE_ALL_HEARTBEAT_SECONDS` | Progress reminder interval. Default `30` seconds. |
 | `UPDATE_ALL_TEMP_MAX_AGE_MINUTES` | Minimum age for stale run-directory cleanup. Default `1440` minutes. |
-
-For example, `UPDATE_ALL_VERBOSE=1` and `UPDATE_ALL_DEEP_CLEAN=1` enable full output
-and deep cleanup without command-line flags.
 
 ## Logs and interruption
 

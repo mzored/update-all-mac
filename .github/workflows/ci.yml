@@ -24,8 +24,8 @@ jobs:
       - name: Check formatting with shfmt
         run: shfmt -i 4 -ci -bn -d update-all-mac.command
 
-      - name: Check release documentation
-        run: tests/release_docs_test.sh
+      - name: Check documentation
+        run: tests/documentation_test.sh
 
       - name: Run behavior tests
         run: tests/uv_homebrew_only_test.sh

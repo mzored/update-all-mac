@@ -2,15 +2,13 @@
 
 [Back to README](../README.md)
 
-## Repository layout
+## Run from source
 
-| Path | Purpose |
-| --- | --- |
-| `update-all-mac.command` | Executable updater. Homebrew installs it as `update-all-mac`. |
-| `Formula/` | Homebrew formula. |
-| `tests/` | Shell regression tests with temporary fixtures and cleanup traps. |
-| `docs/` | User reference, troubleshooting and development notes. |
-| `.github/workflows/` | CI checks and tagged releases. |
+```bash
+git clone https://github.com/mzored/update-all-mac.git
+cd update-all-mac
+./update-all-mac.command --help
+```
 
 ## Checks
 
@@ -20,7 +18,7 @@ Run from the repository root. ShellCheck and shfmt must be installed.
 bash -n update-all-mac.command
 shellcheck -s bash update-all-mac.command
 shfmt -i 4 -ci -bn -d update-all-mac.command
-tests/release_docs_test.sh
+tests/documentation_test.sh
 ruby -c Formula/update-all-mac.rb
 git diff --check
 ```
